@@ -2,90 +2,119 @@ import os
 import subprocess
 import time
 import urllib.request
+import urllib.error
 import json
 import base64
 import socket
-import torch
+import re
 import numpy as np
 from PIL import Image
 import io
 
-# Глобальный словарь для умного управления процессами сервера
-# Формат: {"process": Popen_object, "model_path": str, "port": int}
 ACTIVE_SERVER = {}
 
+class AnyType(str):
+    """Специальный класс-хак для поддержки любого типа данных (ANY) на входах ComfyUI"""
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+ANY = AnyType("*")
+
 def get_free_port():
-    """Находит свободный порт в системе для запуска сервера."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
 
-def tensor_to_base64(image_tensor):
-    """Конвертирует изображение ComfyUI (тензор) в Base64 для отправки в llama.cpp"""
-    i = 255. * image_tensor[0].cpu().numpy()
-    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-    buffered = io.BytesIO()
-    img.save(buffered, format="JPEG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+def tensors_to_base64_list(image_tensor, max_frames=8):
+    """
+    Конвертирует батч картинок (видео) в список строк Base64.
+    Равномерно сэмплирует max_frames, если кадров слишком много.
+    """
+    total_frames = image_tensor.shape[0]
+    
+    # Если кадров больше, чем разрешено, берем равномерные "срезы"
+    if total_frames <= max_frames:
+        indices = list(range(total_frames))
+    else:
+        indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
+        
+    print(f"\n[LlamaCPP DEBUG] Получено видео/батч из {total_frames} кадров. Сэмплируем {len(indices)} кадров: {indices}")
+
+    b64_list =[]
+    for i in indices:
+        img_np = 255. * image_tensor[i].cpu().numpy()
+        img = Image.fromarray(np.clip(img_np, 0, 255).astype(np.uint8))
+        
+        # Можно раскомментировать, чтобы посмотреть размеры каждого кадра
+        # print(f"[LlamaCPP DEBUG] Кадр {i}: Разрешение {img.width}x{img.height}")
+        
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG", quality=85)
+        b64_list.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
+        
+    return b64_list
 
 def kill_active_server():
-    """Принудительно убивает текущий процесс llama-server для очистки памяти."""
     global ACTIVE_SERVER
     if "process" in ACTIVE_SERVER and ACTIVE_SERVER["process"] is not None:
         try:
             ACTIVE_SERVER["process"].kill()
             ACTIVE_SERVER["process"].wait(timeout=5)
         except Exception as e:
-            print(f"[LlamaCPP] Ошибка при выгрузке модели: {e}")
+            print(f"[LlamaCPP ERROR] Ошибка при выгрузке модели: {e}")
+    if "log_file" in ACTIVE_SERVER and ACTIVE_SERVER["log_file"] is not None:
+        try:
+            ACTIVE_SERVER["log_file"].close()
+        except:
+            pass
     ACTIVE_SERVER = {}
-    print("[LlamaCPP] Модель успешно выгружена из памяти.")
+    print("[LlamaCPP] Модель выгружена, процесс завершен.")
 
 class LlamaCPPSubprocessNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Важно: указываем именно llama-server.exe
                 "executable_path": ("STRING", {"default": r"D:\Programs\Portable\llama.cpp\llama-server.exe"}),
                 "model_path": ("STRING", {"default": r"D:\Models\llama-3.gguf"}),
-                "prompt": ("STRING", {"multiline": True, "default": "Опиши это изображение или ответь на вопрос."}),
+                "prompt": ("STRING", {"multiline": True, "default": "Опиши это видео или изображения подробно."}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
-                "ctx_size": ("INT", {"default": 2048, "min": 512, "max": 128000, "step": 256}),
-                "max_tokens": ("INT", {"default": 512, "min": 1, "max": 8192}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "ctx_size": ("INT", {"default": 16384, "min": 512, "max": 128000, "step": 256}), # Увеличил дефолт для видео
+                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "gpu_layers": ("INT", {"default": 99, "min": -1, "max": 100}), # -1 для авто/без GPU, 99 для фулл GPU
+                "gpu_layers": ("INT", {"default": 99, "min": -1, "max": 100}),
             },
             "optional": {
                 "system_prompt": ("STRING", {"multiline": True, "default": "You are a helpful AI assistant."}),
-                "image": ("IMAGE", ), # Картинка из ComfyUI
-                "audio_video_path": ("STRING", {"default": ""}), # Путь к файлу (если модель поддерживает видео/аудио)
-                "mmproj_path": ("STRING", {"default": ""}), # Путь к mmproj для LLaVA
+                "image": ("IMAGE", ), # Теперь принимает и батчи (видео)
+                "max_video_frames": ("INT", {"default": 8, "min": 1, "max": 128, "step": 1}), # Контроль кадров
+                "audio_video_path": ("STRING", {"default": ""}), # Запасной вариант для старых моделей
+                "mmproj_path": ("STRING", {"default": ""}),
                 "top_k": ("INT", {"default": 40, "min": 1, "max": 100}),
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "extra_cli_args": ("STRING", {"default": ""}), # Любые дополнительные параметры для llama.cpp
+                "extra_cli_args": ("STRING", {"default": ""}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("text", "thoughts")
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, executable_path, model_path, prompt, keep_model_loaded, ctx_size, max_tokens, 
-                      temperature, gpu_layers, system_prompt="", image=None, audio_video_path="", 
+    def generate_text(self, executable_path, model_path, prompt, keep_model_loaded, seed, ctx_size, max_tokens, 
+                      temperature, gpu_layers, system_prompt="", image=None, max_video_frames=8, audio_video_path="", 
                       mmproj_path="", top_k=40, top_p=0.95, extra_cli_args=""):
         
         global ACTIVE_SERVER
 
-        # Умное управление памятью: если запрашивается другая модель, убиваем старую
         if ACTIVE_SERVER.get("model_path") != model_path and "process" in ACTIVE_SERVER:
-            print(f"[LlamaCPP] Смена модели обнаружена. Выгрузка старой модели...")
+            print(f"\n[LlamaCPP] Смена модели. Выгрузка старой...")
             kill_active_server()
 
-        # Запуск сервера, если он еще не запущен
         if not ACTIVE_SERVER:
             port = get_free_port()
-            cmd = [
+            cmd =[
                 executable_path,
                 "-m", model_path,
                 "-c", str(ctx_size),
@@ -99,13 +128,14 @@ class LlamaCPPSubprocessNode:
             if extra_cli_args:
                 cmd.extend(extra_cli_args.split())
 
-            print(f"[LlamaCPP] Запуск сервера: {' '.join(cmd)}")
-            # Запускаем в фоне, подавляя логи (чтобы не спамить консоль ComfyUI)
-            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            print(f"\n[LlamaCPP] Запуск сервера: {' '.join(cmd)}")
+            log_file_path = os.path.join(os.getcwd(), "llama_server_debug.log")
+            log_file = open(log_file_path, "w", encoding="utf-8")
             
-            # Ждем пока сервер поднимется
+            process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            
             server_ready = False
-            for _ in range(60): # Ждем до 60 секунд
+            for _ in range(60):
                 try:
                     req = urllib.request.Request(f"http://127.0.0.1:{port}/health", method="GET")
                     with urllib.request.urlopen(req, timeout=1) as response:
@@ -117,38 +147,42 @@ class LlamaCPPSubprocessNode:
             
             if not server_ready:
                 process.kill()
-                raise Exception("[LlamaCPP] Сервер не смог запуститься или время ожидания истекло.")
+                log_file.close()
+                raise Exception("[LlamaCPP ERROR] Сервер не запустился. Смотрите llama_server_debug.log")
             
-            ACTIVE_SERVER = {"process": process, "model_path": model_path, "port": port}
-            print(f"[LlamaCPP] Модель {os.path.basename(model_path)} успешно загружена.")
+            ACTIVE_SERVER = {"process": process, "model_path": model_path, "port": port, "log_file": log_file}
+            print(f"[LlamaCPP] Сервер готов на порту {port}.")
 
-        # Формируем payload для генерации (совместим с OpenAI API, который поддерживает llama-server)
         port = ACTIVE_SERVER["port"]
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
-        messages = []
+        messages =[]
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        # Обработка пользовательского промпта и мультимодальности
-        user_content = []
+        user_content =[]
         
-        # Если есть аудио/видео путь, добавляем его в текст (зависит от вашей модели Qwen-Audio и т.д.)
+        # Если передан физический путь
         if audio_video_path and os.path.exists(audio_video_path):
             user_content.append({"type": "text", "text": f"Media file attached: {audio_video_path}\n"})
-            # Если ваша сборка llama.cpp имеет кастомные теги для аудио:
-            user_content.append({"type": "text", "text": f"<|audio|>{audio_video_path}<|endofaudio|>\n"})
         
-        user_content.append({"type": "text", "text": prompt})
-
-        # Если подана картинка из ComfyUI
+        # Обработка визуального входа ComfyUI (Картинка или Батч картинок/Видео)
         if image is not None:
-            base64_img = tensor_to_base64(image)
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}
-            })
+            # Получаем список Base64-кадров (с лимитом max_video_frames)
+            b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
+            
+            if len(b64_images) > 1:
+                user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
+                
+            # Добавляем каждый кадр в payload
+            for b64_img in b64_images:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
+                })
 
+        # Добавляем текстовый промпт в самом конце массива (строго после кадров)
+        user_content.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": user_content})
 
         payload = {
@@ -156,50 +190,83 @@ class LlamaCPPSubprocessNode:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "top_k": top_k,
-            "top_p": top_p
+            "top_p": top_p,
+            "seed": seed
         }
-
-        # Отправляем запрос на генерацию
-        print("[LlamaCPP] Генерация ответа...")
+        
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
         
+        clean_text = ""
+        thoughts_text = ""
+
         try:
             with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                generated_text = result['choices'][0]['message']['content']
-        except Exception as e:
-            generated_text = f"Ошибка генерации: {e}"
+                raw_data = response.read().decode('utf-8')
+                result = json.loads(raw_data)
+                message = result['choices'][0]['message']
+                
+                raw_content = message.get('content', '') or ''
+                api_reasoning = message.get('reasoning_content', '') or ''
+                
+                clean_text = raw_content
+                thoughts_text = api_reasoning
 
-        # Управление выгрузкой
+                think_match = re.search(r'<think>(.*?)</think>', clean_text, flags=re.DOTALL | re.IGNORECASE)
+                if think_match:
+                    if not thoughts_text:
+                        thoughts_text = think_match.group(1).strip()
+                    clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                else:
+                    think_match_open = re.search(r'<think>(.*)', clean_text, flags=re.DOTALL | re.IGNORECASE)
+                    if think_match_open:
+                        if not thoughts_text:
+                            thoughts_text = think_match_open.group(1).strip()
+                        clean_text = re.sub(r'<think>.*', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                        clean_text = "[ОШИБКА: Модели не хватило max_tokens, чтобы закончить мысль и выдать ответ.]\n" + clean_text
+
+                clean_text = clean_text.lstrip() 
+                
+                if not clean_text.strip() and not thoughts_text.strip():
+                    clean_text = "[Пустой ответ]. Возможные причины: mmproj не смог прочитать картинку/видео или закончился ctx_size."
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            clean_text = f"API Ошибка {e.code}: {error_body}"
+        except Exception as e:
+            clean_text = f"Сетевая ошибка: {e}"
+
         if not keep_model_loaded:
-            print("[LlamaCPP] keep_model_loaded=False. Выгружаем модель...")
             kill_active_server()
 
-        return (generated_text, )
+        return (clean_text, thoughts_text)
 
 
 class LlamaCPPUnloadNode:
-    """Нода для ручной принудительной очистки VRAM (убивает процесс llama-server)"""
+    """Сквозная нода (Pass-through) для удобной выгрузки сервера прямо в рабочем процессе"""
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Dummy вход, чтобы можно было прикрепить ноду к графу выполнения
-                "trigger": ("BOOLEAN", {"default": True}),
+                "any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст и т.д.)"}),
+                "unload_active": ("BOOLEAN", {"default": True, "label_on": "Unload", "label_off": "Pass only"}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("status",)
+    RETURN_TYPES = (ANY,)
+    RETURN_NAMES = ("passthrough",)
     FUNCTION = "unload_models"
     CATEGORY = "LlamaCPP/Memory"
 
-    def unload_models(self, trigger):
-        kill_active_server()
-        return ("All Llama models unloaded from VRAM.", )
+    def unload_models(self, any_input, unload_active):
+        if unload_active:
+            print("\n[LlamaCPP] Сквозная нода инициировала выгрузку...")
+            kill_active_server()
+        else:
+            print("\n[LlamaCPP] Сквозная нода пропущена (unload_active = False).")
+            
+        return (any_input, )
 
-# Регистрация нод в ComfyUI
 NODE_CLASS_MAPPINGS = {
     "LlamaCPP_Subprocess": LlamaCPPSubprocessNode,
     "LlamaCPP_UnloadAll": LlamaCPPUnloadNode

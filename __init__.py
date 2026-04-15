@@ -243,28 +243,30 @@ class LlamaCPPSubprocessNode:
 
 
 class LlamaCPPUnloadNode:
-    """Сквозная нода (Pass-through) для удобной выгрузки сервера прямо в рабочем процессе"""
+    """Нода для выгрузки сервера и освобождения VRAM/RAM"""
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
+            "optional": {
                 "any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст и т.д.)"}),
+            },
+            "required": {
                 "unload_active": ("BOOLEAN", {"default": True, "label_on": "Unload", "label_off": "Pass only"}),
             }
         }
 
     RETURN_TYPES = (ANY,)
-    RETURN_NAMES = ("passthrough",)
     FUNCTION = "unload_models"
     CATEGORY = "LlamaCPP/Memory"
+    OUTPUT_NODE = True
 
-    def unload_models(self, any_input, unload_active):
+    def unload_models(self, unload_active, any_input=None):
         if unload_active:
-            print("\n[LlamaCPP] Сквозная нода инициировала выгрузку...")
+            print("\n[LlamaCPP] Нода инициировала выгрузку...")
             kill_active_server()
         else:
-            print("\n[LlamaCPP] Сквозная нода пропущена (unload_active = False).")
-            
+            print("\n[LlamaCPP] Выгрузка пропущена (unload_active = False).")
+
         return (any_input, )
 
 NODE_CLASS_MAPPINGS = {

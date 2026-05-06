@@ -11,6 +11,8 @@ This project merges our persistent server logic (video/batch support, fast API c
 
 ---
 
+![Node UI](https://github.com/bananasss00/ComfyUI-LlamaCPP-Subprocess/blob/master/workflow.png?raw=true)
+
 ## ✨ Key Features
 
 * 🚀 **Zero Cold Starts**: The model stays loaded in VRAM/RAM between generations. The server restarts only if you change critical settings (model, context size, memory mode).

@@ -190,29 +190,91 @@ class LlamaCPPSubprocessNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": (model_options(), {"tooltip": "GGUF model loaded from ComfyUI/models/LLM"}),
-                "prompt": ("STRING", {"multiline": True, "default": "Опиши это видео или изображения подробно."}),
-                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "top_k": ("INT", {"default": 40, "min": 1, "max": 100}),
-                "ctx_size": ("INT", {"default": 16384, "min": 512, "max": 128000, "step": 256}),
-                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {"default": "auto"}),
-                "gpu_layers": ("INT", {"default": 99, "min": -1, "max": 999, "tooltip": "Used if memory_mode involves gpu"}),
-                "n_cpu_moe_layers": ("INT", {"default": 1, "min": 1, "max": 999, "tooltip": "Used if memory_mode involves CPU MoE"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "reasoning": (["auto", "on", "off"], {"default": "auto"}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "model": (model_options(), {
+                    "tooltip": "GGUF model. Place files in ComfyUI/models/LLM. mmproj files are hidden from this list."
+                }),
+                "mmproj": (mmproj_options(), {
+                    "default": NO_MMPROJ, 
+                    "tooltip": "Vision projector GGUF. Required for images/video. Place files in ComfyUI/models/LLM."
+                }),
+                "prompt": ("STRING", {
+                    "multiline": True, 
+                    "default": "Опиши это видео или изображения подробно.",
+                    "tooltip": "User prompt sent to the selected model."
+                }),
+                "max_tokens": ("INT", {
+                    "default": 2048, "min": 1, "max": 32768,
+                    "tooltip": "Maximum number of tokens to generate."
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Sampling temperature. Lower is more deterministic."
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05,
+                    "tooltip": "Nucleus sampling threshold."
+                }),
+                "top_k": ("INT", {
+                    "default": 40, "min": 1, "max": 100,
+                    "tooltip": "Top-K sampling cutoff."
+                }),
+                "ctx_size": ("INT", {
+                    "default": 16384, "min": 512, "max": 128000, "step": 256,
+                    "tooltip": "Context window size in tokens. Larger context uses more VRAM."
+                }),
+                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
+                    "default": "auto",
+                    "tooltip": "Advanced memory placement mode: auto, gpu_layers, cpu_moe_layers, or gpu_and_cpu_moe_layers."
+                }),
+                "gpu_layers": ("INT", {
+                    "default": 99, "min": -1, "max": 999, 
+                    "tooltip": "Used only in gpu_layers and gpu_and_cpu_moe_layers modes. Number of model layers to place on the GPU."
+                }),
+                "n_cpu_moe_layers": ("INT", {
+                    "default": 1, "min": 1, "max": 999, 
+                    "tooltip": "Used only in cpu_moe_layers and gpu_and_cpu_moe_layers modes. Number of MoE layers to keep on the CPU."
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed. Use 0 for a random seed."
+                }),
+                "reasoning": (["auto", "on", "off"], {
+                    "default": "auto",
+                    "tooltip": "Reasoning output mode."
+                }),
+                "keep_model_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If True, the server stays alive in background. If False, unloads model after generation to free VRAM."
+                }),
             },
             "optional": {
-                "mmproj": (mmproj_options(), {"default": NO_MMPROJ, "tooltip": "Vision projector GGUF for multimodal."}),
-                "system_prompt_preset": (system_prompt_options(), {"default": NO_SYSTEM_PROMPT}),
-                "system_prompt_text": ("STRING", {"multiline": True, "default": "", "tooltip": "Optional manual text prompt. Will be appended to preset."}),
-                "image": ("IMAGE", ),
-                "max_video_frames": ("INT", {"default": 8, "min": 1, "max": 128, "step": 1}),
-                "audio_video_path": ("STRING", {"default": ""}),
-                "executable_path": ("STRING", {"default": "auto", "tooltip": "'auto' to auto-download, or full path to llama-server.exe"}),
-                "extra_cli_args": ("STRING", {"default": ""}),
+                "system_prompt_preset": (system_prompt_options(), {
+                    "default": NO_SYSTEM_PROMPT,
+                    "tooltip": "System prompt preset. Place your .txt files in ComfyUI/models/LLM/prompts"
+                }),
+                "system_prompt_text": ("STRING", {
+                    "multiline": True, "default": "", 
+                    "tooltip": "Optional manual text prompt. Will be appended to the preset."
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Optional image input. A single image or ComfyUI batch (video sequence) is passed to llama-server."
+                }),
+                "max_video_frames": ("INT", {
+                    "default": 8, "min": 1, "max": 128, "step": 1,
+                    "tooltip": "Maximum number of frames to sample evenly from a video/image batch."
+                }),
+                "audio_video_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional absolute path to an external media file on disk."
+                }),
+                "executable_path": ("STRING", {
+                    "default": "auto", 
+                    "tooltip": "'auto' to auto-download, or full absolute path to your llama-server.exe"
+                }),
+                "extra_cli_args": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional advanced llama.cpp parameters. Leave empty for normal use."
+                }),
             }
         }
 
@@ -221,8 +283,8 @@ class LlamaCPPSubprocessNode:
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, model, prompt, max_tokens, temperature, top_p, top_k, ctx_size, memory_mode, gpu_layers, 
-                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, mmproj=NO_MMPROJ, system_prompt_preset=NO_SYSTEM_PROMPT, 
+    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, memory_mode, gpu_layers, 
+                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args=""):
         
         global ACTIVE_SERVER

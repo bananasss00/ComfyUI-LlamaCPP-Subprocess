@@ -185,6 +185,60 @@ def kill_active_server():
     ACTIVE_SERVER = {}
     print("[LlamaCPP] Модель выгружена, процесс завершен.")
 
+class LlamaCPPAdvancedSamplersNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dynatemp_range": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Dynamic Temperature (0 = выкл). Меняет температуру в зависимости от уверенности модели."
+                }),
+                "dynatemp_exponent": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Степень (exponent) для Dynamic Temperature."
+                }),
+                "xtc_probability": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Exclude Top Choices (0 = выкл). Исключает самые вероятные слова для повышения креативности."
+                }),
+                "xtc_threshold": ("FLOAT", {
+                    "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Порог вероятности для работы XTC."
+                }),
+                "smoothing_factor": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Logit smoothing (0 = выкл). Сглаживает распределение вероятностей."
+                }),
+                "smoothing_curve": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Форма кривой для сглаживания логитов."
+                }),
+            },
+            "optional": {
+                "banned_tokens": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Список запрещенных слов/фраз (каждая с новой строки). Нода сама переведет их в logit_bias."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LLAMA_SAMPLERS",)
+    RETURN_NAMES = ("samplers",)
+    FUNCTION = "get_samplers"
+    CATEGORY = "LlamaCPP/Inference"
+
+    def get_samplers(self, dynatemp_range, dynatemp_exponent, xtc_probability, xtc_threshold, smoothing_factor, smoothing_curve, banned_tokens=""):
+        return ({
+            "dynatemp_range": dynatemp_range,
+            "dynatemp_exponent": dynatemp_exponent,
+            "xtc_probability": xtc_probability,
+            "xtc_threshold": xtc_threshold,
+            "smoothing_factor": smoothing_factor,
+            "smoothing_curve": smoothing_curve,
+            "banned_tokens": banned_tokens
+        },)
+    
 class LlamaCPPSubprocessNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -248,6 +302,9 @@ class LlamaCPPSubprocessNode:
                 }),
             },
             "optional": {
+                "extra_samplers": ("LLAMA_SAMPLERS", {
+                    "tooltip": "Подключите сюда ноду Advanced Samplers."
+                }),
                 "system_prompt_preset": (system_prompt_options(), {
                     "default": NO_SYSTEM_PROMPT,
                     "tooltip": "System prompt preset. Place your .txt files in ComfyUI/models/LLM/prompts"
@@ -285,7 +342,7 @@ class LlamaCPPSubprocessNode:
 
     def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args=""):
+                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None):
         
         global ACTIVE_SERVER
 
@@ -401,12 +458,44 @@ class LlamaCPPSubprocessNode:
         user_content.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": user_content})
 
+        # ИЗВЛЕКАЕМ ДОПОЛНИТЕЛЬНЫЕ СЕМПЛЕРЫ
+        samplers_dict = extra_samplers if extra_samplers else {}
+        banned_tokens_str = samplers_dict.get("banned_tokens", "")
+        
         payload = {
             "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
             "top_k": top_k, "top_p": top_p, "seed": normalize_llama_seed(seed),
-            "stream": True # <-- STREAMING FOR INTERRUPTS!
+            "stream": True,
+            "dynatemp_range": samplers_dict.get("dynatemp_range", 0.0),
+            "dynatemp_exponent": samplers_dict.get("dynatemp_exponent", 1.0),
+            "xtc_probability": samplers_dict.get("xtc_probability", 0.0),
+            "xtc_threshold": samplers_dict.get("xtc_threshold", 0.1),
+            "smoothing_factor": samplers_dict.get("smoothing_factor", 0.0),
+            "smoothing_curve": samplers_dict.get("smoothing_curve", 1.0),
         }
-        
+
+        # ОБРАБОТКА ЗАПРЕЩЕННЫХ СЛОВ (LOGIT BIAS)
+        if banned_tokens_str and banned_tokens_str.strip():
+            logit_bias = {}
+            for word in banned_tokens_str.split('\n'):
+                word = word.strip()
+                if not word: continue
+                
+                tok_url = f"http://127.0.0.1:{ACTIVE_SERVER['port']}/tokenize"
+                tok_data = json.dumps({"content": word}).encode('utf-8')
+                tok_req = urllib.request.Request(tok_url, data=tok_data, headers={'Content-Type': 'application/json'})
+                try:
+                    with urllib.request.urlopen(tok_req) as response:
+                        tok_res = json.loads(response.read().decode('utf-8'))
+                        # Выставляем вероятность этих токенов на -100.0
+                        for tid in tok_res.get("tokens", []):
+                            logit_bias[str(tid)] = -100.0
+                except Exception as e:
+                    print(f"[LlamaCPP Warning] Не удалось токенизировать запрещенное слово '{word}': {e}")
+            
+            if logit_bias:
+                payload["logit_bias"] = logit_bias
+
         # SEND REQUEST
         url = f"http://127.0.0.1:{ACTIVE_SERVER['port']}/v1/chat/completions"
         data = json.dumps(payload).encode('utf-8')
@@ -496,11 +585,13 @@ class LlamaCPPUnloadNode:
         return (any_input, )
 
 NODE_CLASS_MAPPINGS = {
+    "LlamaCPP_AdvancedSamplers": LlamaCPPAdvancedSamplersNode,
     "LlamaCPP_Subprocess": LlamaCPPSubprocessNode,
     "LlamaCPP_UnloadAll": LlamaCPPUnloadNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LlamaCPP_AdvancedSamplers": "LlamaCPP Advanced Samplers",
     "LlamaCPP_Subprocess": "LlamaCPP Server Model",
     "LlamaCPP_UnloadAll": "LlamaCPP Unload All"
 }

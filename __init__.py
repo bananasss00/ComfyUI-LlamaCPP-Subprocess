@@ -308,6 +308,13 @@ class LlamaCPPSubprocessNode:
             "args": extra_cli_args, "reasoning": reasoning
         }
 
+        # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
+        if ACTIVE_SERVER:
+            proc = ACTIVE_SERVER.get("process")
+            if proc and proc.poll() is not None:
+                print(f"\n[LlamaCPP] Процесс сервера упал/убит извне (Код {proc.returncode}). Авто-перезапуск...")
+                kill_active_server()
+
         if ACTIVE_SERVER.get("config") != current_config and "process" in ACTIVE_SERVER:
             print(f"\n[LlamaCPP] Изменение настроек модели. Выгрузка старой...")
             kill_active_server()

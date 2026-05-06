@@ -10,14 +10,140 @@ import re
 import numpy as np
 from PIL import Image
 import io
+import fnmatch
+import platform
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import folder_paths
+import comfy.model_management
+
+# =======================================================================
+# 1. СИСТЕМА ПУТЕЙ И РЕЕСТР ФАЙЛОВ (DROPDOWNS)
+# =======================================================================
+
+LLM_FOLDER = "llm_text_processor_models"
+PROMPT_FOLDER = "llm_text_processor_prompts"
+NO_SYSTEM_PROMPT = "none"
+NO_MMPROJ = "none"
+NO_MODELS_FOUND = "No GGUF models found"
+
+def llm_root() -> Path:
+    return Path(folder_paths.models_dir) / "LLM"
+
+def prompt_root() -> Path:
+    return llm_root() / "prompts"
+
+def register_folders() -> None:
+    llm_dir = llm_root()
+    prompts_dir = prompt_root()
+    llm_dir.mkdir(parents=True, exist_ok=True)
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    
+    folder_paths.folder_names_and_paths[LLM_FOLDER] = ([str(llm_dir)], {".gguf"})
+    folder_paths.folder_names_and_paths[PROMPT_FOLDER] = ([str(prompts_dir)], {".txt"})
+
+def model_options() -> list[str]:
+    files = folder_paths.get_filename_list(LLM_FOLDER)
+    models =[name for name in files if "mmproj" not in Path(name).name.lower()]
+    return models or [NO_MODELS_FOUND]
+
+def mmproj_options() -> list[str]:
+    files = folder_paths.get_filename_list(LLM_FOLDER)
+    mmproj =[name for name in files if "mmproj" in Path(name).name.lower()]
+    return [NO_MMPROJ] + mmproj
+
+def system_prompt_options() -> list[str]:
+    files = folder_paths.get_filename_list(PROMPT_FOLDER)
+    top_level_files =[name for name in files if os.sep not in name and "/" not in name]
+    return [NO_SYSTEM_PROMPT] + top_level_files
+
+def full_model_path(name: str) -> Path:
+    path = folder_paths.get_full_path(LLM_FOLDER, name)
+    return Path(path) if path else Path("")
+
+register_folders()
+
+# =======================================================================
+# 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
+# =======================================================================
+
+LLAMA_CPP_RELEASE_TAG = "b9041"
+RELEASE_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_RELEASE_TAG}"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
+
+@dataclass(frozen=True)
+class PlatformSpec:
+    key: str
+    cli_executable: str
+    asset_patterns: tuple[str, ...]
+    required_files: tuple[str, ...]
+
+WINDOWS_CUDA_13 = PlatformSpec(
+    key="win-x64-cuda13",
+    cli_executable="llama-server.exe",
+    asset_patterns=(
+        "llama-*-bin-win-cuda-13*-x64.zip",
+        "cudart-llama-bin-win-cuda-13*-x64.zip",
+    ),
+    required_files=("llama-server.exe", "ggml-cuda.dll", "cudart64_13.dll"),
+)
+
+def _download_file(url: str, destination: Path) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-LLM"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        with destination.open("wb") as f:
+            while chunk := resp.read(1024 * 256):
+                f.write(chunk)
+
+def ensure_llama_server_paths() -> str:
+    system = platform.system().lower()
+    if system != "windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
+        raise RuntimeError("Auto-download is only supported on Windows x64. Please specify your executable_path manually.")
+    
+    spec = WINDOWS_CUDA_13
+    install_dir = VENDOR_ROOT / LLAMA_CPP_RELEASE_TAG / spec.key
+    exe_path = install_dir / spec.cli_executable
+
+    if exe_path.exists():
+        return str(exe_path)
+
+    print("[LlamaCPP] Auto-downloading llama-server.exe... Please wait.")
+    install_dir.mkdir(parents=True, exist_ok=True)
+    
+    req = urllib.request.Request(RELEASE_API_URL, headers={"User-Agent": "ComfyUI-LLM"})
+    with urllib.request.urlopen(req) as response:
+        release = json.loads(response.read().decode("utf-8"))
+    
+    with TemporaryDirectory() as temp:
+        temp_dir = Path(temp)
+        for pattern in spec.asset_patterns:
+            matches = [a for a in release.get("assets", []) if fnmatch.fnmatch(a.get("name", "").lower(), pattern.lower())]
+            if matches:
+                asset = sorted(matches, key=lambda i: i.get("name", ""))[0]
+                archive_path = temp_dir / asset["name"]
+                _download_file(asset["browser_download_url"], archive_path)
+                with zipfile.ZipFile(archive_path) as archive:
+                    archive.extractall(install_dir)
+                    
+    if not exe_path.exists():
+        raise RuntimeError(f"Failed to find {spec.cli_executable} after download.")
+    return str(exe_path)
+
+# =======================================================================
+# 3. ОСНОВНАЯ ЛОГИКА И СЕРВЕР
+# =======================================================================
 
 ACTIVE_SERVER = {}
+MMPROJ_EMBEDDING_MISMATCH_RE = re.compile(
+    r"mismatch between text model \(n_embd = (?P<model>\d+)\) and mmproj \(n_embd = (?P<mmproj>\d+)\)", flags=re.IGNORECASE
+)
 
 class AnyType(str):
-    """Специальный класс-хак для поддержки любого типа данных (ANY) на входах ComfyUI"""
-    def __ne__(self, __value: object) -> bool:
-        return False
-
+    def __ne__(self, __value: object) -> bool: return False
 ANY = AnyType("*")
 
 def get_free_port():
@@ -25,48 +151,37 @@ def get_free_port():
         s.bind(("", 0))
         return s.getsockname()[1]
 
+def normalize_llama_seed(seed: int) -> int:
+    seed = int(seed)
+    if seed <= 0: return 42 # Fallback to 42 for random/invalid to avoid overflow crashes
+    return seed % (2**32)
+
 def tensors_to_base64_list(image_tensor, max_frames=8):
-    """
-    Конвертирует батч картинок (видео) в список строк Base64.
-    Равномерно сэмплирует max_frames, если кадров слишком много.
-    """
     total_frames = image_tensor.shape[0]
-    
-    # Если кадров больше, чем разрешено, берем равномерные "срезы"
     if total_frames <= max_frames:
         indices = list(range(total_frames))
     else:
         indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
         
-    print(f"\n[LlamaCPP DEBUG] Получено видео/батч из {total_frames} кадров. Сэмплируем {len(indices)} кадров: {indices}")
-
     b64_list =[]
     for i in indices:
         img_np = 255. * image_tensor[i].cpu().numpy()
         img = Image.fromarray(np.clip(img_np, 0, 255).astype(np.uint8))
-        
-        # Можно раскомментировать, чтобы посмотреть размеры каждого кадра
-        # print(f"[LlamaCPP DEBUG] Кадр {i}: Разрешение {img.width}x{img.height}")
-        
         buffered = io.BytesIO()
         img.save(buffered, format="JPEG", quality=85)
         b64_list.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-        
     return b64_list
 
 def kill_active_server():
     global ACTIVE_SERVER
-    if "process" in ACTIVE_SERVER and ACTIVE_SERVER["process"] is not None:
+    if "process" in ACTIVE_SERVER and ACTIVE_SERVER["process"]:
         try:
             ACTIVE_SERVER["process"].kill()
             ACTIVE_SERVER["process"].wait(timeout=5)
-        except Exception as e:
-            print(f"[LlamaCPP ERROR] Ошибка при выгрузке модели: {e}")
-    if "log_file" in ACTIVE_SERVER and ACTIVE_SERVER["log_file"] is not None:
-        try:
-            ACTIVE_SERVER["log_file"].close()
-        except:
-            pass
+        except: pass
+    if "log_file" in ACTIVE_SERVER and ACTIVE_SERVER["log_file"]:
+        try: ACTIVE_SERVER["log_file"].close()
+        except: pass
     ACTIVE_SERVER = {}
     print("[LlamaCPP] Модель выгружена, процесс завершен.")
 
@@ -75,58 +190,79 @@ class LlamaCPPSubprocessNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "executable_path": ("STRING", {"default": r"D:\Programs\Portable\llama.cpp\llama-server.exe"}),
-                "model_path": ("STRING", {"default": r"D:\Models\llama-3.gguf"}),
+                "model": (model_options(), {"tooltip": "GGUF model loaded from ComfyUI/models/LLM"}),
                 "prompt": ("STRING", {"multiline": True, "default": "Опиши это видео или изображения подробно."}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "ctx_size": ("INT", {"default": 16384, "min": 512, "max": 128000, "step": 256}), # Увеличил дефолт для видео
-                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
+                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "gpu_layers": ("INT", {"default": 99, "min": -1, "max": 100}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 40, "min": 1, "max": 100}),
+                "ctx_size": ("INT", {"default": 16384, "min": 512, "max": 128000, "step": 256}),
+                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {"default": "auto"}),
+                "gpu_layers": ("INT", {"default": 99, "min": -1, "max": 999, "tooltip": "Used if memory_mode involves gpu"}),
+                "n_cpu_moe_layers": ("INT", {"default": 1, "min": 1, "max": 999, "tooltip": "Used if memory_mode involves CPU MoE"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "reasoning": (["auto", "on", "off"], {"default": "auto"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "system_prompt": ("STRING", {"multiline": True, "default": "You are a helpful AI assistant."}),
-                "image": ("IMAGE", ), # Теперь принимает и батчи (видео)
-                "max_video_frames": ("INT", {"default": 8, "min": 1, "max": 128, "step": 1}), # Контроль кадров
-                "audio_video_path": ("STRING", {"default": ""}), # Запасной вариант для старых моделей
-                "mmproj_path": ("STRING", {"default": ""}),
-                "top_k": ("INT", {"default": 40, "min": 1, "max": 100}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "mmproj": (mmproj_options(), {"default": NO_MMPROJ, "tooltip": "Vision projector GGUF for multimodal."}),
+                "system_prompt_preset": (system_prompt_options(), {"default": NO_SYSTEM_PROMPT}),
+                "system_prompt_text": ("STRING", {"multiline": True, "default": "", "tooltip": "Optional manual text prompt. Will be appended to preset."}),
+                "image": ("IMAGE", ),
+                "max_video_frames": ("INT", {"default": 8, "min": 1, "max": 128, "step": 1}),
+                "audio_video_path": ("STRING", {"default": ""}),
+                "executable_path": ("STRING", {"default": "auto", "tooltip": "'auto' to auto-download, or full path to llama-server.exe"}),
                 "extra_cli_args": ("STRING", {"default": ""}),
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("text", "thoughts")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("text", "thoughts", "perf")
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, executable_path, model_path, prompt, keep_model_loaded, seed, ctx_size, max_tokens, 
-                      temperature, gpu_layers, system_prompt="", image=None, max_video_frames=8, audio_video_path="", 
-                      mmproj_path="", top_k=40, top_p=0.95, extra_cli_args=""):
+    def generate_text(self, model, prompt, max_tokens, temperature, top_p, top_k, ctx_size, memory_mode, gpu_layers, 
+                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, mmproj=NO_MMPROJ, system_prompt_preset=NO_SYSTEM_PROMPT, 
+                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args=""):
         
         global ACTIVE_SERVER
 
-        if ACTIVE_SERVER.get("model_path") != model_path and "process" in ACTIVE_SERVER:
-            print(f"\n[LlamaCPP] Смена модели. Выгрузка старой...")
+        if model == NO_MODELS_FOUND:
+            raise ValueError("No models found. Please put .gguf files in ComfyUI/models/LLM")
+
+        # Resolve paths
+        m_path = str(full_model_path(model))
+        mm_path = str(full_model_path(mmproj)) if mmproj != NO_MMPROJ else ""
+        
+        if executable_path.strip().lower() == "auto":
+            exe_path = ensure_llama_server_paths()
+        else:
+            exe_path = executable_path
+
+        # Create config hash to detect if we need to restart server
+        current_config = {
+            "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, 
+            "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
+            "args": extra_cli_args, "reasoning": reasoning
+        }
+
+        if ACTIVE_SERVER.get("config") != current_config and "process" in ACTIVE_SERVER:
+            print(f"\n[LlamaCPP] Изменение настроек модели. Выгрузка старой...")
             kill_active_server()
 
+        # START SERVER IF NEEDED
         if not ACTIVE_SERVER:
             port = get_free_port()
-            cmd =[
-                executable_path,
-                "-m", model_path,
-                "-c", str(ctx_size),
-                "--port", str(port)
-            ]
+            cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port)]
             
-            if gpu_layers >= 0:
+            if memory_mode in {"gpu_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["-ngl", str(gpu_layers)])
-            if mmproj_path:
-                cmd.extend(["--mmproj", mmproj_path])
-            if extra_cli_args:
-                cmd.extend(extra_cli_args.split())
+            if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
+                cmd.extend(["--n-cpu-moe", str(n_cpu_moe_layers)])
+            
+            if mm_path: cmd.extend(["--mmproj", mm_path])
+            if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
+            if extra_cli_args: cmd.extend(extra_cli_args.split())
 
             print(f"\n[LlamaCPP] Запуск сервера: {' '.join(cmd)}")
             log_file_path = os.path.join(os.getcwd(), "llama_server_debug.log")
@@ -148,111 +284,135 @@ class LlamaCPPSubprocessNode:
             if not server_ready:
                 process.kill()
                 log_file.close()
-                raise Exception("[LlamaCPP ERROR] Сервер не запустился. Смотрите llama_server_debug.log")
+                with open(log_file_path, "r", encoding="utf-8") as f:
+                    err_text = f.read()
+                
+                # Check for smart error parsing (mmproj mismatch)
+                mm_match = MMPROJ_EMBEDDING_MISMATCH_RE.search(err_text)
+                if mm_match:
+                    raise RuntimeError(
+                        f"ВНИМАНИЕ: Выбранный mmproj не подходит к этой текстовой модели! "
+                        f"(модель n_embd={mm_match.group('model')}, mmproj n_embd={mm_match.group('mmproj')}). "
+                        "Выберите mmproj, соответствующий архитектуре модели."
+                    )
+                raise Exception(f"[LlamaCPP ERROR] Сервер не запустился. Лог: {err_text[-1000:]}")
             
-            ACTIVE_SERVER = {"process": process, "model_path": model_path, "port": port, "log_file": log_file}
+            ACTIVE_SERVER = {"process": process, "config": current_config, "port": port, "log_file": log_file}
             print(f"[LlamaCPP] Сервер готов на порту {port}.")
 
-        port = ACTIVE_SERVER["port"]
-        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        # COMPILE SYSTEM PROMPT
+        sys_str = ""
+        if system_prompt_preset != NO_SYSTEM_PROMPT:
+            preset_path = folder_paths.get_full_path(PROMPT_FOLDER, system_prompt_preset)
+            if preset_path and os.path.exists(preset_path):
+                with open(preset_path, "r", encoding="utf-8") as f:
+                    sys_str += f.read() + "\n"
+        if system_prompt_text.strip():
+            sys_str += system_prompt_text
 
+        # PREPARE MESSAGES
         messages =[]
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        if sys_str.strip():
+            messages.append({"role": "system", "content": sys_str.strip()})
 
         user_content =[]
-        
-        # Если передан физический путь
         if audio_video_path and os.path.exists(audio_video_path):
             user_content.append({"type": "text", "text": f"Media file attached: {audio_video_path}\n"})
         
-        # Обработка визуального входа ComfyUI (Картинка или Батч картинок/Видео)
         if image is not None:
-            # Получаем список Base64-кадров (с лимитом max_video_frames)
-            b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
-            
-            if len(b64_images) > 1:
-                user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
-                
-            # Добавляем каждый кадр в payload
-            for b64_img in b64_images:
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                })
+            if not mm_path:
+                print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
+            else:
+                b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
+                if len(b64_images) > 1:
+                    user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
+                for b64_img in b64_images:
+                    user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
 
-        # Добавляем текстовый промпт в самом конце массива (строго после кадров)
         user_content.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": user_content})
 
         payload = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_k": top_k,
-            "top_p": top_p,
-            "seed": seed
+            "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+            "top_k": top_k, "top_p": top_p, "seed": normalize_llama_seed(seed),
+            "stream": True # <-- STREAMING FOR INTERRUPTS!
         }
         
+        # SEND REQUEST
+        url = f"http://127.0.0.1:{ACTIVE_SERVER['port']}/v1/chat/completions"
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
         
         clean_text = ""
         thoughts_text = ""
+        perf_text = ""
 
         try:
             with urllib.request.urlopen(req) as response:
-                raw_data = response.read().decode('utf-8')
-                result = json.loads(raw_data)
-                message = result['choices'][0]['message']
-                
-                raw_content = message.get('content', '') or ''
-                api_reasoning = message.get('reasoning_content', '') or ''
-                
-                clean_text = raw_content
-                thoughts_text = api_reasoning
-
-                think_match = re.search(r'<think>(.*?)</think>', clean_text, flags=re.DOTALL | re.IGNORECASE)
-                if think_match:
-                    if not thoughts_text:
-                        thoughts_text = think_match.group(1).strip()
-                    clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-                else:
-                    think_match_open = re.search(r'<think>(.*)', clean_text, flags=re.DOTALL | re.IGNORECASE)
-                    if think_match_open:
-                        if not thoughts_text:
-                            thoughts_text = think_match_open.group(1).strip()
-                        clean_text = re.sub(r'<think>.*', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-                        clean_text = "[ОШИБКА: Модели не хватило max_tokens, чтобы закончить мысль и выдать ответ.]\n" + clean_text
-
-                clean_text = clean_text.lstrip() 
-                
-                if not clean_text.strip() and not thoughts_text.strip():
-                    clean_text = "[Пустой ответ]. Возможные причины: mmproj не смог прочитать картинку/видео или закончился ctx_size."
+                for line in response:
+                    # ComfyUI Interrupt Support
+                    if comfy.model_management.processing_interrupted():
+                        print("\n[LlamaCPP] Генерация отменена пользователем (Interrupt).")
+                        clean_text += "\n\n[Генерация прервана]"
+                        break
+                        
+                    decoded_line = line.decode('utf-8').strip()
+                    if not decoded_line.startswith("data: "): continue
+                    
+                    content = decoded_line[6:]
+                    if content == "[DONE]": break
+                    
+                    try:
+                        chunk = json.loads(content)
+                        if "choices" in chunk and chunk["choices"]:
+                            delta = chunk["choices"][0].get("delta", {})
+                            clean_text += delta.get("content", "") or ""
+                            thoughts_text += delta.get("reasoning_content", "") or ""
+                        
+                        if "usage" in chunk and "completion_tokens" in chunk["usage"]:
+                            usage = chunk.get("usage", {})
+                            # В llama-server потоке иногда пробрасывается метрика timings
+                            # Для точной метрики мы можем использовать данные из лога или usage
+                            pass
+                            
+                        # Специфичные тайминги от llama.cpp
+                        if "timings" in chunk:
+                            t_prompt = chunk["timings"].get("prompt_per_second", 0)
+                            t_gen = chunk["timings"].get("predicted_per_second", 0)
+                            perf_text = f"Prompt: {t_prompt:.1f} t/s | Generation: {t_gen:.1f} t/s"
+                            
+                    except json.JSONDecodeError: pass
 
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8')
-            clean_text = f"API Ошибка {e.code}: {error_body}"
+            clean_text = f"API Ошибка {e.code}: {e.read().decode('utf-8')}"
         except Exception as e:
             clean_text = f"Сетевая ошибка: {e}"
+
+        # Fallback regex parsing (if model puts <think> in main content instead of reasoning_content)
+        if "<think>" in clean_text:
+            think_match = re.search(r'<think>(.*?)</think>', clean_text, flags=re.DOTALL | re.IGNORECASE)
+            if think_match:
+                if not thoughts_text: thoughts_text = think_match.group(1).strip()
+                clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            else:
+                think_match_open = re.search(r'<think>(.*)', clean_text, flags=re.DOTALL | re.IGNORECASE)
+                if think_match_open:
+                    if not thoughts_text: thoughts_text = think_match_open.group(1).strip()
+                    clean_text = re.sub(r'<think>.*', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    clean_text = "[ОШИБКА: Модели не хватило max_tokens для ответа.]\n" + clean_text
 
         if not keep_model_loaded:
             kill_active_server()
 
-        return (clean_text, thoughts_text)
+        return (clean_text.strip(), thoughts_text.strip(), perf_text)
 
 
 class LlamaCPPUnloadNode:
-    """Нода для выгрузки сервера и освобождения VRAM/RAM"""
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "optional": {
-                "any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст и т.д.)"}),
-            },
-            "required": {
-                "unload_active": ("BOOLEAN", {"default": True, "label_on": "Unload", "label_off": "Pass only"}),
-            }
+            "optional": {"any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст и т.д.)"})},
+            "required": {"unload_active": ("BOOLEAN", {"default": True, "label_on": "Unload", "label_off": "Pass only"})}
         }
 
     RETURN_TYPES = (ANY,)
@@ -264,9 +424,6 @@ class LlamaCPPUnloadNode:
         if unload_active:
             print("\n[LlamaCPP] Нода инициировала выгрузку...")
             kill_active_server()
-        else:
-            print("\n[LlamaCPP] Выгрузка пропущена (unload_active = False).")
-
         return (any_input, )
 
 NODE_CLASS_MAPPINGS = {
@@ -275,6 +432,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LlamaCPP_Subprocess": "LlamaCPP Process (Multimodal)",
-    "LlamaCPP_UnloadAll": "LlamaCPP Unload All Models"
+    "LlamaCPP_Subprocess": "LlamaCPP Server Model",
+    "LlamaCPP_UnloadAll": "LlamaCPP Unload All"
 }

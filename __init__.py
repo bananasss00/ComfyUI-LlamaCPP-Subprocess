@@ -121,7 +121,7 @@ def ensure_llama_server_paths() -> str:
     with TemporaryDirectory() as temp:
         temp_dir = Path(temp)
         for pattern in spec.asset_patterns:
-            matches = [a for a in release.get("assets", []) if fnmatch.fnmatch(a.get("name", "").lower(), pattern.lower())]
+            matches =[a for a in release.get("assets", []) if fnmatch.fnmatch(a.get("name", "").lower(), pattern.lower())]
             if matches:
                 asset = sorted(matches, key=lambda i: i.get("name", ""))[0]
                 archive_path = temp_dir / asset["name"]
@@ -276,6 +276,10 @@ class LlamaCPPSubprocessNode:
                     "default": 16384, "min": 512, "max": 128000, "step": 256,
                     "tooltip": "Context window size in tokens. Larger context uses more VRAM."
                 }),
+                "context_quantization": (["none", "q8", "q4"], {
+                    "default": "none",
+                    "tooltip": "KV cache quantization. 'q8' saves ~50% context VRAM, 'q4' saves ~75%."
+                }),
                 "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
                     "default": "auto",
                     "tooltip": "Advanced memory placement mode: auto, gpu_layers, cpu_moe_layers, or gpu_and_cpu_moe_layers."
@@ -340,7 +344,7 @@ class LlamaCPPSubprocessNode:
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, memory_mode, gpu_layers, 
+    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None):
         
@@ -360,7 +364,7 @@ class LlamaCPPSubprocessNode:
 
         # Create config hash to detect if we need to restart server
         current_config = {
-            "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, 
+            "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, "ctx_q": context_quantization,
             "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
             "args": extra_cli_args, "reasoning": reasoning
         }
@@ -385,6 +389,11 @@ class LlamaCPPSubprocessNode:
                 cmd.extend(["-ngl", str(gpu_layers)])
             if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["--n-cpu-moe", str(n_cpu_moe_layers)])
+            
+            if context_quantization == "q8":
+                cmd.extend(["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"])
+            elif context_quantization == "q4":
+                cmd.extend(["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"])
             
             if mm_path: cmd.extend(["--mmproj", mm_path])
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])

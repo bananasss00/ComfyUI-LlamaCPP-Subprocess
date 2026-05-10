@@ -30,6 +30,19 @@ NO_SYSTEM_PROMPT = "none"
 NO_MMPROJ = "none"
 NO_MODELS_FOUND = "No GGUF models found"
 
+# Словарь с базовыми пресетами промптов
+DEFAULT_PROMPTS = {
+    "prompt_refine_expand.txt": "Refine and enhance the following user prompt for creative text-to-image generation. Keep the meaning and keywords, make it more expressive and visually rich. Output ONLY the improved prompt text (no preface, no bullets, no JSON, no <think>, no commentary).",
+    "short_story.txt": "Write a short, imaginative story inspired by this image or video.",
+    "video_summary.txt": "Summarize the key events and narrative points in this video.",
+    "detailed_analysis.txt": "Output ONLY these sections with short labels (no bullets): Subject; People (if any); Environment; Lighting; Camera/Composition; Color/Texture. In each section, write 2–4 sentences of concrete visible details. If something is not visible, write 'not visible'. No preface, no reasoning, no <think>.",
+    "cinematic_description.txt": "Write ONE cinematic paragraph (8–12 sentences). Describe the scene like a film still: subject(s) and action; environment and atmosphere; lighting design (practical lights vs ambient, direction, contrast); camera language (shot type, angle, lens feel, depth of field, motion implied); composition and mood. Keep it vivid but factual (no made-up story). No preface, no reasoning, no <think>.",
+    "ultra_detailed_description.txt": "Write ONE ultra-detailed paragraph (10–16 sentences, ~180–320 words). Stay grounded in visible details. Include: subject micro-details (materials, textures, patterns, wear, reflections); people details if present (hair, skin tones, makeup, jewelry, fabric types, fit); environment depth (foreground/midground/background, signage/props, surface materials); lighting analysis (key/fill/back light, direction, softness, highlights, shadow shape); camera perspective (angle, lens feel, depth of field) and composition (leading lines, negative space, symmetry/asymmetry, visual hierarchy). No preface, no reasoning, no <think>.",
+    "detailed_description.txt": "Write ONE detailed paragraph (6–10 sentences). Describe only what is visible: subject(s) and actions; people details if present (approx age group, gender expression if clear, hair, facial expression, pose, clothing, accessories); environment (location type, background elements, time cues); lighting (source, direction, softness/hardness, color temperature, shadows); camera viewpoint (eye-level/low/high, distance) and composition (framing, focal emphasis). No preface, no reasoning, no <think>.",
+    "simple_description.txt": "Analyze the image and write a single concise sentence that describes the main subject and setting. Keep it grounded in visible details only.",
+    "tags.txt": "Your task is to generate a clean list of comma-separated tags for a text-to-image AI, based *only* on the visual information in the image. Limit the output to a maximum of 50 unique tags. Strictly describe visual elements like subject, clothing, environment, colors, lighting, and composition. Do not include abstract concepts, interpretations, marketing terms, or technical jargon (e.g., no 'SEO', 'brand-aligned', 'viral potential'). The goal is a concise list of visual descriptors. Avoid repeating tags."
+}
+
 def llm_root() -> Path:
     return Path(folder_paths.models_dir) / "LLM"
 
@@ -41,6 +54,16 @@ def register_folders() -> None:
     prompts_dir = prompt_root()
     llm_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Автоматическое создание пресетов, если их нет
+    for filename, content in DEFAULT_PROMPTS.items():
+        filepath = prompts_dir / filename
+        if not filepath.exists():
+            try:
+                filepath.write_text(content, encoding="utf-8")
+                print(f"[LlamaCPP] Создан стандартный пресет: {filename}")
+            except Exception as e:
+                print(f"[LlamaCPP] Предупреждение: не удалось создать пресет {filename}. Ошибка: {e}")
     
     folder_paths.folder_names_and_paths[LLM_FOLDER] = ([str(llm_dir)], {".gguf"})
     folder_paths.folder_names_and_paths[PROMPT_FOLDER] = ([str(prompts_dir)], {".txt"})
@@ -184,6 +207,18 @@ def kill_active_server():
         except: pass
     ACTIVE_SERVER = {}
     print("[LlamaCPP] Модель выгружена, процесс завершен.")
+
+if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
+    comfy.model_management._original_unload_all_models_llamacpp = comfy.model_management.unload_all_models
+
+    def hooked_unload_all_models_llamacpp(*args, **kwargs):
+        # 1. Сначала убиваем наш процесс Llama
+        kill_active_server()
+        # 2. Затем вызываем оригинальную очистку памяти ComfyUI (модели SD, VAE и т.д.)
+        return comfy.model_management._original_unload_all_models_llamacpp(*args, **kwargs)
+    
+    # Подменяем стандартную функцию на нашу обертку
+    comfy.model_management.unload_all_models = hooked_unload_all_models_llamacpp
 
 class LlamaCPPAdvancedSamplersNode:
     @classmethod

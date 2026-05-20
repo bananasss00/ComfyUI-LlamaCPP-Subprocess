@@ -14,6 +14,9 @@ import fnmatch
 import platform
 import zipfile
 import threading
+import inspect
+import atexit
+import execution
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -220,17 +223,48 @@ def kill_active_server():
         
     print("[LlamaCPP] Модель выгружена, процесс завершен.")
 
+# Убиваем процесс при полном закрытии ComfyUI
+atexit.register(kill_active_server)
+
 if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
     comfy.model_management._original_unload_all_models_llamacpp = comfy.model_management.unload_all_models
 
     def hooked_unload_all_models_llamacpp(*args, **kwargs):
-        # 1. Сначала убиваем наш процесс Llama
-        kill_active_server()
-        # 2. Затем вызываем оригинальную очистку памяти ComfyUI (модели SD, VAE и т.д.)
+        try:
+            stack = inspect.stack()
+            # Проверяем, вызвано ли это прямо во время выполнения графа (например, нодой Painter VRAM)
+            is_node_execution = any("execution.py" in frame.filename for frame in stack)
+        except Exception:
+            is_node_execution = False
+
+        if not is_node_execution:
+            kill_active_server()
+            
         return comfy.model_management._original_unload_all_models_llamacpp(*args, **kwargs)
     
-    # Подменяем стандартную функцию на нашу обертку
     comfy.model_management.unload_all_models = hooked_unload_all_models_llamacpp
+
+# 3. Перехват запуска графа: Авто-очистка при переключении на воркфлоу без Llama
+if not hasattr(execution.PromptExecutor, "_original_execute_llamacpp"):
+    execution.PromptExecutor._original_execute_llamacpp = execution.PromptExecutor.execute
+
+    def hooked_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        # Ищем нашу ноду в списке узлов, которые сейчас будут выполняться
+        has_llama = False
+        if isinstance(prompt, dict):
+            for node_id, node_info in prompt.items():
+                if isinstance(node_info, dict) and node_info.get("class_type") == "LlamaCPP_Subprocess":
+                    has_llama = True
+                    break
+        
+        # Если мы нажали "Queue Prompt", а ноды LlamaCPP_Subprocess в этом воркфлоу НЕТ —
+        # значит мы переключились на другой процесс. Смело выгружаем модель и освобождаем VRAM!
+        if not has_llama:
+            kill_active_server()
+
+        return self._original_execute_llamacpp(prompt, prompt_id, extra_data, execute_outputs)
+
+    execution.PromptExecutor.execute = hooked_execute
 
 class LlamaCPPAdvancedSamplersNode:
     @classmethod

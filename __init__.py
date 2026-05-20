@@ -13,6 +13,7 @@ import io
 import fnmatch
 import platform
 import zipfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -161,9 +162,26 @@ def ensure_llama_server_paths() -> str:
 # =======================================================================
 
 ACTIVE_SERVER = {}
+ORIGINAL_EXTRA_RESERVED_VRAM = None
 MMPROJ_EMBEDDING_MISMATCH_RE = re.compile(
     r"mismatch between text model \(n_embd = (?P<model>\d+)\) and mmproj \(n_embd = (?P<mmproj>\d+)\)", flags=re.IGNORECASE
 )
+
+def get_vram_from_log(log_path: str) -> int:
+    """Парсит лог llama-server в поисках выделенной VRAM, возвращает объем в байтах"""
+    if not os.path.exists(log_path): return 0
+    vram_mb = 0.0
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            # Ищет упоминания "VRAM", "CUDA0 buffer size", "Vulkan0 KV buffer size" и суммирует
+            matches = re.findall(r'(?:VRAM|(?:CUDA|Vulkan|Metal|SYCL)\d+.*?buffer size)[^:\n]*[:=]\s*([\d.]+)\s*MiB', content, re.IGNORECASE)
+            if matches:
+                for m in matches:
+                    vram_mb += float(m)
+    except Exception as e:
+        print(f"[LlamaCPP] Ошибка чтения лога VRAM: {e}")
+    return int(vram_mb * 1024 * 1024)
 
 class AnyType(str):
     def __ne__(self, __value: object) -> bool: return False
@@ -196,7 +214,7 @@ def tensors_to_base64_list(image_tensor, max_frames=8):
     return b64_list
 
 def kill_active_server():
-    global ACTIVE_SERVER
+    global ACTIVE_SERVER, ORIGINAL_EXTRA_RESERVED_VRAM
     if "process" in ACTIVE_SERVER and ACTIVE_SERVER["process"]:
         try:
             ACTIVE_SERVER["process"].kill()
@@ -206,6 +224,16 @@ def kill_active_server():
         try: ACTIVE_SERVER["log_file"].close()
         except: pass
     ACTIVE_SERVER = {}
+    
+    # Возвращаем исходное значение EXTRA_RESERVED_VRAM в ComfyUI
+    if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
+        try:
+            comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
+            print(f"[LlamaCPP] Восстановлено исходное значение EXTRA_RESERVED_VRAM: {ORIGINAL_EXTRA_RESERVED_VRAM / (1024**3):.2f} GB")
+        except Exception as e:
+            pass
+        ORIGINAL_EXTRA_RESERVED_VRAM = None
+        
     print("[LlamaCPP] Модель выгружена, процесс завершен.")
 
 if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
@@ -371,6 +399,10 @@ class LlamaCPPSubprocessNode:
                     "default": "",
                     "tooltip": "Optional advanced llama.cpp parameters. Leave empty for normal use."
                 }),
+                "extra_reserve_vram": ("FLOAT", {
+                    "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
+                    "tooltip": "Additional VRAM in GB to reserve on top of the model size to prevent ComfyUI OOMs."
+                }),
             }
         }
 
@@ -381,9 +413,9 @@ class LlamaCPPSubprocessNode:
 
     def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None):
+                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None, extra_reserve_vram=0.6):
         
-        global ACTIVE_SERVER
+        global ACTIVE_SERVER, ORIGINAL_EXTRA_RESERVED_VRAM
 
         if model == NO_MODELS_FOUND:
             raise ValueError("No models found. Please put .gguf files in ComfyUI/models/LLM")
@@ -418,7 +450,8 @@ class LlamaCPPSubprocessNode:
         # START SERVER IF NEEDED
         if not ACTIVE_SERVER:
             port = get_free_port()
-            cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port)]
+            # Добавляем ключ -lv 4 для детального вывода памяти
+            cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
             
             if memory_mode in {"gpu_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["-ngl", str(gpu_layers)])
@@ -438,7 +471,16 @@ class LlamaCPPSubprocessNode:
             log_file_path = os.path.join(os.getcwd(), "llama_server_debug.log")
             log_file = open(log_file_path, "w", encoding="utf-8")
             
-            process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore")
+            
+            def pipe_reader():
+                for line in process.stdout:
+                    try:
+                        log_file.write(line)
+                    except Exception:
+                        break
+                        
+            threading.Thread(target=pipe_reader, daemon=True).start()
             
             server_ready = False
             for _ in range(60):
@@ -469,6 +511,26 @@ class LlamaCPPSubprocessNode:
             
             ACTIVE_SERVER = {"process": process, "config": current_config, "port": port, "log_file": log_file}
             print(f"[LlamaCPP] Сервер готов на порту {port}.")
+
+            if ORIGINAL_EXTRA_RESERVED_VRAM is None:
+                ORIGINAL_EXTRA_RESERVED_VRAM = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
+
+            if ACTIVE_SERVER.get("log_file") and not ACTIVE_SERVER["log_file"].closed:
+                ACTIVE_SERVER["log_file"].flush()
+
+            log_path = os.path.join(os.getcwd(), "llama_server_debug.log")
+            exact_vram_bytes = get_vram_from_log(log_path)
+
+            if exact_vram_bytes > 0:
+                exact_vram_gb = exact_vram_bytes / (1024 ** 3)
+                total_reserve_gb = exact_vram_gb + extra_reserve_vram
+                comfy.model_management.EXTRA_RESERVED_VRAM = int(total_reserve_gb * (1024 ** 3))
+                print(f"[LlamaCPP] VRAM зарезервировано: {total_reserve_gb:.2f} GB (Модель: {exact_vram_gb:.2f} GB + Буфер: {extra_reserve_vram:.2f} GB)")
+            else:
+                print("[LlamaCPP] Не удалось извлечь потребление VRAM из лога. Используются стандартные лимиты памяти.")
+                if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
+                    comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
+                    ORIGINAL_EXTRA_RESERVED_VRAM = None
 
         # COMPILE SYSTEM PROMPT
         sys_str = ""

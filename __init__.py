@@ -167,22 +167,6 @@ MMPROJ_EMBEDDING_MISMATCH_RE = re.compile(
     r"mismatch between text model \(n_embd = (?P<model>\d+)\) and mmproj \(n_embd = (?P<mmproj>\d+)\)", flags=re.IGNORECASE
 )
 
-def get_vram_from_log(log_path: str) -> int:
-    """Парсит лог llama-server в поисках выделенной VRAM, возвращает объем в байтах"""
-    if not os.path.exists(log_path): return 0
-    vram_mb = 0.0
-    try:
-        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            # Ищет упоминания "VRAM", "CUDA0 buffer size", "Vulkan0 KV buffer size" и суммирует
-            matches = re.findall(r'(?:VRAM|(?:CUDA|Vulkan|Metal|SYCL)\d+.*?buffer size)[^:\n]*[:=]\s*([\d.]+)\s*MiB', content, re.IGNORECASE)
-            if matches:
-                for m in matches:
-                    vram_mb += float(m)
-    except Exception as e:
-        print(f"[LlamaCPP] Ошибка чтения лога VRAM: {e}")
-    return int(vram_mb * 1024 * 1024)
-
 class AnyType(str):
     def __ne__(self, __value: object) -> bool: return False
 ANY = AnyType("*")
@@ -473,10 +457,17 @@ class LlamaCPPSubprocessNode:
             
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore")
             
+            # Переменная для перехвата VRAM из потока (используем list для изменения внутри функции)
+            startup_vram_mb = [0.0]
+            vram_pattern = re.compile(r'(?:VRAM|(?:CUDA|Vulkan|Metal|SYCL)\d+.*?buffer size)[^:\n]*[:=]\s*([\d.]+)\s*MiB', re.IGNORECASE)
+            
             def pipe_reader():
                 for line in process.stdout:
                     try:
                         log_file.write(line)
+                        match = vram_pattern.search(line)
+                        if match:
+                            startup_vram_mb[0] += float(match.group(1))
                     except Exception:
                         break
                         
@@ -515,11 +506,9 @@ class LlamaCPPSubprocessNode:
             if ORIGINAL_EXTRA_RESERVED_VRAM is None:
                 ORIGINAL_EXTRA_RESERVED_VRAM = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
 
-            if ACTIVE_SERVER.get("log_file") and not ACTIVE_SERVER["log_file"].closed:
-                ACTIVE_SERVER["log_file"].flush()
-
-            log_path = os.path.join(os.getcwd(), "llama_server_debug.log")
-            exact_vram_bytes = get_vram_from_log(log_path)
+            # Даем потоку долю секунды на обработку последних строк перед тем как забрать результат
+            time.sleep(0.2)
+            exact_vram_bytes = int(startup_vram_mb[0] * 1024 * 1024)
 
             if exact_vram_bytes > 0:
                 exact_vram_gb = exact_vram_bytes / (1024 ** 3)
@@ -527,7 +516,7 @@ class LlamaCPPSubprocessNode:
                 comfy.model_management.EXTRA_RESERVED_VRAM = int(total_reserve_gb * (1024 ** 3))
                 print(f"[LlamaCPP] VRAM зарезервировано: {total_reserve_gb:.2f} GB (Модель: {exact_vram_gb:.2f} GB + Буфер: {extra_reserve_vram:.2f} GB)")
             else:
-                print("[LlamaCPP] Не удалось извлечь потребление VRAM из лога. Используются стандартные лимиты памяти.")
+                print("[LlamaCPP] Не удалось извлечь потребление VRAM из потока. Используются стандартные лимиты памяти.")
                 if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
                     comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
                     ORIGINAL_EXTRA_RESERVED_VRAM = None

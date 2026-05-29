@@ -273,69 +273,69 @@ class LlamaCPPAdvancedSamplersNode:
             "required": {
                 "dynatemp_range": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Dynamic Temperature (0 = выкл). Меняет температуру в зависимости от уверенности модели."
+                    "tooltip": "Динамическая температура (0 = выкл). Позволяет модели быть креативной, снижая предсказуемость, но не сходя с ума на очевидных словах."
                 }),
                 "dynatemp_exponent": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Степень (exponent) для Dynamic Temperature."
+                    "tooltip": "Степень (форма кривой) для динамической температуры. Обычно оставляют 1.0 (линейная)."
                 }),
                 "xtc_probability": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Exclude Top Choices (0 = выкл). Исключает самые вероятные слова для повышения креативности."
+                    "tooltip": "Вероятность XTC (Exclude Top Choices). С какой вероятностью алгоритм исключит самые ожидаемые (популярные) слова, заставляя модель строить оригинальные фразы."
                 }),
                 "xtc_threshold": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Порог вероятности для работы XTC."
+                    "tooltip": "Порог XTC. Исключаются только те слова, базовая вероятность которых выше этого значения (например, выше 10%)."
                 }),
                 "smoothing_factor": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Logit smoothing (0 = выкл). Сглаживает распределение вероятностей."
+                    "tooltip": "Сглаживание логитов (Logit Smoothing). Делает распределение выбора слов менее резким. 0 = выключено."
                 }),
                 "smoothing_curve": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Форма кривой для сглаживания логитов."
+                    "tooltip": "Форма кривой для алгоритма сглаживания вероятностей."
                 }),
                 "min_p": ("FLOAT", {
                     "default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Min-P sampling. 0.0 = disabled. Replaces tokens with probability lower than min_p * max_probability."
+                    "tooltip": "Динамический порог (Min-P). Значение 0.05 отбросит все слова, вероятность которых меньше 5% от вероятности самого подходящего слова. Отличная замена Top-K и Top-P."
                 }),
                 "presence_penalty": ("FLOAT", {
                     "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Penalizes new tokens based on whether they appear in the text so far."
+                    "tooltip": "Штраф за присутствие. Заставляет модель избегать повторения уже затронутых тем и слов. Повышает разнообразие текста."
                 }),
                 "frequency_penalty": ("FLOAT", {
                     "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Penalizes new tokens based on their existing frequency in the text."
+                    "tooltip": "Штраф за частоту. Чем чаще слово уже встречалось в тексте, тем сильнее будет штраф. Полезно для избавления от слов-паразитов."
                 }),
                 "repeat_penalty": ("FLOAT", {
                     "default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Repetition penalty (1.0 = disabled)."
+                    "tooltip": "Штраф за повторения (Repetition Penalty). Значение 1.0 отключает штраф. Значения выше (например 1.1) заставляют модель реже зацикливаться на одних и тех же фразах."
                 }),
                 "mirostat": ("INT", {
                     "default": 0, "min": 0, "max": 2, "step": 1,
-                    "tooltip": "Mirostat sampling (0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0). Keeps perplexity constant."
+                    "tooltip": "Mirostat (0 = выкл, 1 = v1, 2 = v2). Умный алгоритм, который автоматически поддерживает качество текста на одном уровне. При использовании лучше отключать Top-K/Top-P."
                 }),
                 "mirostat_tau": ("FLOAT", {
                     "default": 5.0, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "Mirostat target entropy (tau)."
+                    "tooltip": "Целевая энтропия Mirostat (Tau). Чем выше значение, тем более неожиданным (креативным) будет текст. Обычно используют 5.0."
                 }),
                 "mirostat_eta": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Mirostat learning rate (eta)."
+                    "tooltip": "Скорость обучения Mirostat (Eta). Как быстро алгоритм подстраивается под изменения текста. Обычно используют 0.1."
                 }),
                 "tfs_z": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Tail Free Sampling (1.0 = disabled)."
+                    "tooltip": "Tail Free Sampling (TFS). 1.0 = выключено. Плавно отсекает 'хвост' из самых маловероятных слов, менее агрессивен, чем Top-P."
                 }),
                 "typical_p": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Typical Sampling (1.0 = disabled)."
+                    "tooltip": "Typical Sampling. 1.0 = выключено. Алгоритм пытается выбирать слова, вероятность которых близка к ожидаемой естественной случайности контекста."
                 }),
             },
             "optional": {
                 "banned_tokens": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "Список запрещенных слов/фраз (каждая с новой строки). Нода сама переведет их в logit_bias."
+                    "tooltip": "Список запрещенных слов или фраз (каждая с новой строки). Нода переведет их в logit_bias, и модель никогда их не напишет."
                 }),
             }
         }
@@ -371,104 +371,132 @@ class LlamaCPPSubprocessNode:
         return {
             "required": {
                 "model": (model_options(), {
-                    "tooltip": "GGUF model. Place files in ComfyUI/models/LLM. mmproj files are hidden from this list."
+                    "tooltip": "Файл GGUF модели для текста. Поместите файлы в папку ComfyUI/models/LLM. Файлы mmproj (для зрения) здесь скрыты."
                 }),
                 "mmproj": (mmproj_options(), {
                     "default": NO_MMPROJ, 
-                    "tooltip": "Vision projector GGUF. Required for images/video. Place files in ComfyUI/models/LLM."
+                    "tooltip": "Файл проектора зрения (Vision GGUF). Нужен ТОЛЬКО если вы передаете картинки/видео. Обязательно должен подходить к архитектуре основной текстовой модели."
                 }),
                 "prompt": ("STRING", {
                     "multiline": True, 
                     "default": "Опиши это видео или изображения подробно.",
-                    "tooltip": "User prompt sent to the selected model."
+                    "tooltip": "Текст вашего запроса (промпт), который вы отправляете модели."
                 }),
                 "max_tokens": ("INT", {
                     "default": 2048, "min": 1, "max": 32768,
-                    "tooltip": "Maximum number of tokens to generate."
+                    "tooltip": "Максимальное количество слов (токенов), которое разрешено сгенерировать модели в ответе."
                 }),
                 "temperature": ("FLOAT", {
                     "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Sampling temperature. Lower is more deterministic."
+                    "tooltip": "Температура генерации. Низкая (0.1) делает текст строгим и предсказуемым. Высокая (1.0+) делает текст более творческим и случайным."
                 }),
                 "top_p": ("FLOAT", {
                     "default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05,
-                    "tooltip": "Nucleus sampling threshold."
+                    "tooltip": "Top-P (Nucleus). Ограничивает выборку слов, оставляя только те, которые в сумме дают указанную вероятность (0.95 = 95% наиболее вероятных слов)."
                 }),
                 "top_k": ("INT", {
                     "default": 40, "min": 1, "max": 100,
-                    "tooltip": "Top-K sampling cutoff."
+                    "tooltip": "Top-K. Жесткое ограничение: выбирать следующее слово только из K самых вероятных вариантов (например, из 40 лучших)."
                 }),
                 "ctx_size": ("INT", {
                     "default": 16384, "min": 512, "max": 128000, "step": 256,
-                    "tooltip": "Context window size in tokens. Larger context uses more VRAM."
-                }),
-                "context_quantization": (["none", "q8", "q4"], {
-                    "default": "none",
-                    "tooltip": "KV cache quantization. 'q8' saves ~50% context VRAM, 'q4' saves ~75%."
-                }),
-                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
-                    "default": "auto",
-                    "tooltip": "Advanced memory placement mode: auto, gpu_layers, cpu_moe_layers, or gpu_and_cpu_moe_layers."
-                }),
-                "gpu_layers": ("INT", {
-                    "default": 99, "min": -1, "max": 999, 
-                    "tooltip": "Used only in gpu_layers and gpu_and_cpu_moe_layers modes. Number of model layers to place on the GPU."
-                }),
-                "n_cpu_moe_layers": ("INT", {
-                    "default": 1, "min": 1, "max": 999, 
-                    "tooltip": "Used only in cpu_moe_layers and gpu_and_cpu_moe_layers modes. Number of MoE layers to keep on the CPU."
-                }),
-                "seed": ("INT", {
-                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
-                    "tooltip": "Random seed. Use 0 for a random seed."
-                }),
-                "reasoning": (["auto", "on", "off"], {
-                    "default": "auto",
-                    "tooltip": "Reasoning output mode."
-                }),
-                "keep_model_loaded": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "If True, the server stays alive in background. If False, unloads model after generation to free VRAM."
-                }),
-            },
-            "optional": {
-                "extra_samplers": ("LLAMA_SAMPLERS", {
-                    "tooltip": "Подключите сюда ноду Advanced Samplers."
-                }),
-                "system_prompt_preset": (system_prompt_options(), {
-                    "default": NO_SYSTEM_PROMPT,
-                    "tooltip": "System prompt preset. Place your .txt files in ComfyUI/models/LLM/prompts"
-                }),
-                "system_prompt_text": ("STRING", {
-                    "multiline": True, "default": "", 
-                    "tooltip": "Optional manual text prompt. Will be appended to the preset."
-                }),
-                "image": ("IMAGE", {
-                    "tooltip": "Optional image input. A single image or ComfyUI batch (video sequence) is passed to llama-server."
-                }),
-                "max_video_frames": ("INT", {
-                    "default": 8, "min": 1, "max": 128, "step": 1,
-                    "tooltip": "Maximum number of frames to sample evenly from a video/image batch."
-                }),
-                "audio_video_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional absolute path to an external media file on disk."
-                }),
-                "executable_path": ("STRING", {
-                    "default": "auto", 
-                    "tooltip": "'auto' to auto-download, or full absolute path to your llama-server.exe"
-                }),
-                "extra_cli_args": ("STRING", {
-                    "default": "",
-                    "tooltip": "Optional advanced llama.cpp parameters. Leave empty for normal use."
-                }),
-                "extra_reserve_vram": ("FLOAT", {
-                    "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
-                    "tooltip": "Additional VRAM in GB to reserve on top of the model size to prevent ComfyUI OOMs."
+                    "tooltip": "Размер контекста в токенах. Сколько истории или текста модель 'помнит'. Большие значения (32к+) сильно потребляют видеопамять (VRAM)."
                 }),
                 "flash_attention": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Enable Flash Attention (-fa). Significantly saves VRAM at large context sizes and speeds up generation."
+                    "tooltip": "КРАЙНЕ РЕКОМЕНДУЕТСЯ. Flash Attention (-fa) кардинально снижает потребление видеопамяти при больших контекстах и ускоряет генерацию."
+                }),
+                "context_quantization": (["none", "q8", "q4"], {
+                    "default": "none",
+                    "tooltip": "Квантование контекста (сжатие памяти диалога). 'q8' экономит ~50% VRAM контекста, 'q4' экономит ~75%. Минимально влияет на качество."
+                }),
+                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
+                    "default": "auto",
+                    "tooltip": "Режим распределения слоев модели (Авто, только видеокарта, частично процессор). Выбирайте 'auto', если не уверены."
+                }),
+                "gpu_layers": ("INT", {
+                    "default": 99, "min": -1, "max": 999, 
+                    "tooltip": "Сколько слоев модели загрузить в видеокарту (GPU). 999 означает 'все возможные'. Если не хватает VRAM, постепенно уменьшайте это значение."
+                }),
+                "n_cpu_moe_layers": ("INT", {
+                    "default": 1, "min": 1, "max": 999, 
+                    "tooltip": "Количество MoE-слоев, которые останутся на процессоре (только для моделей со смешанной архитектурой)."
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Зерно случайности. Постоянное значение (например 42) даст одинаковый текст при тех же настройках. 0 = случайный текст каждый раз."
+                }),
+                "reasoning": (["auto", "on", "off"], {
+                    "default": "auto",
+                    "tooltip": "Режим размышления (Reasoning). Нужен для умных моделей вроде DeepSeek-R1, чтобы они выводили процесс решения задачи."
+                }),
+                "keep_model_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Если включено, сервер останется висеть в памяти после ответа (для быстрых повторных запросов). Если выключено - модель полностью выгрузится, освободив VRAM."
+                }),
+                "batch_size": ("INT", {
+                    "default": 512, "min": 1, "max": 8192, "step": 64,
+                    "tooltip": "Скорость чтения промпта (--batch-size). Сколько токенов обрабатывается за раз при анализе входа. 512 - баланс. Уменьшите, если не хватает VRAM."
+                }),
+                "parallel_requests": ("INT", {
+                    "default": 1, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "Количество слотов запросов (-np). Ограничение в 1 слот экономит VRAM, не позволяя серверу резервировать память под параллельных пользователей."
+                }),
+                "no_mmap": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Отключить MMap. Загрузит модель в ОЗУ напрямую, игнорируя дисковый кэш ОС. Помогает при некоторых ошибках чтения или на медленных дисках."
+                }),
+                "no_warmup": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Отключить 'разогрев'. Пропускает начальный тестовый прогон матрицы при старте сервера, экономя пару секунд времени запуска."
+                }),
+                "mlock": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Блокировка в ОЗУ (--mlock). Запрещает системе выгружать модель из оперативной памяти в файл подкачки диска. Устраняет фризы, но требует много свободной ОЗУ."
+                }),
+                "fit_target_mib": ("INT", {
+                    "default": 0, "min": 0, "max": 24000, "step": 256,
+                    "tooltip": "Гарантированный запас свободной VRAM (-fitt) в Мегабайтах. Укажите, сколько видеопамяти Llama обязана оставить нетронутой (например, 3096 для 3 ГБ под генерацию картинок)."
+                }),
+            },
+            "optional": {
+                "override_tensor": ("STRING", {
+                    "default": "",
+                    "tooltip": "Хак для видеопамяти (-ot). Например, '.*ffn_down.*=CPU' принудительно перенесет самые тяжелые слои модели на процессор, освободив VRAM."
+                }),
+                "extra_samplers": ("LLAMA_SAMPLERS", {
+                    "tooltip": "Подключите сюда выход ноды LlamaCPP Advanced Samplers для тонкой настройки вероятностей."
+                }),
+                "system_prompt_preset": (system_prompt_options(), {
+                    "default": NO_SYSTEM_PROMPT,
+                    "tooltip": "Шаблон системного промпта. Ваши .txt файлы из папки ComfyUI/models/LLM/prompts появятся в этом списке."
+                }),
+                "system_prompt_text": ("STRING", {
+                    "multiline": True, "default": "", 
+                    "tooltip": "Дополнительный ручной текст системного промпта. Будет приклеен к выбранному выше шаблону."
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Подключите сюда картинку или батч картинок (видео). Обязательно выберите mmproj-файл выше!"
+                }),
+                "max_video_frames": ("INT", {
+                    "default": 8, "min": 1, "max": 128, "step": 1,
+                    "tooltip": "Максимальное количество кадров, которое будет равномерно извлечено из батча картинок (видео) и отправлено модели."
+                }),
+                "audio_video_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Абсолютный путь к медиафайлу на вашем компьютере (опционально, вместо передачи через вход image)."
+                }),
+                "executable_path": ("STRING", {
+                    "default": "auto", 
+                    "tooltip": "Путь до исполняемого файла llama-server.exe. Значение 'auto' автоматически скачает и настроит нужную версию."
+                }),
+                "extra_cli_args": ("STRING", {
+                    "default": "",
+                    "tooltip": "Любые другие аргументы командной строки llama.cpp. Только для продвинутых юзеров."
+                }),
+                "extra_reserve_vram": ("FLOAT", {
+                    "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
+                    "tooltip": "Дополнительный 'виртуальный' резерв памяти (в ГБ), который мы сообщаем ComfyUI. Помогает избежать ошибок Out Of Memory (OOM) во время генерации картинок."
                 }),
             }
         }
@@ -479,8 +507,8 @@ class LlamaCPPSubprocessNode:
     CATEGORY = "LlamaCPP/Inference"
 
     def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
-                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None, extra_reserve_vram=0.6):
+                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
+                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6):
         
         global ACTIVE_SERVER, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -500,7 +528,9 @@ class LlamaCPPSubprocessNode:
         current_config = {
             "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, "ctx_q": context_quantization,
             "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
-            "args": extra_cli_args, "reasoning": reasoning, "flash_attn": flash_attention
+            "args": extra_cli_args, "reasoning": reasoning, "flash_attn": flash_attention,
+            "batch": batch_size, "np": parallel_requests, "no_mmap": no_mmap, "no_warmup": no_warmup, 
+            "mlock": mlock, "fitt": fit_target_mib, "ot": override_tensor
         }
 
         # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
@@ -521,7 +551,16 @@ class LlamaCPPSubprocessNode:
             cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
             
             if flash_attention:
-                cmd.extend(["-fa"])
+                cmd.extend(["-fa", "on"])
+                
+            cmd.extend(["--batch-size", str(batch_size), "--ubatch-size", str(batch_size)])
+            cmd.extend(["-np", str(parallel_requests)])
+            
+            if no_mmap: cmd.extend(["--no-mmap"])
+            if no_warmup: cmd.extend(["--no-warmup"])
+            if mlock: cmd.extend(["--mlock"])
+            if fit_target_mib > 0: cmd.extend(["-fitt", str(fit_target_mib)])
+            if override_tensor and override_tensor.strip(): cmd.extend(["-ot", override_tensor.strip()])
                 
             if memory_mode in {"gpu_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["-ngl", str(gpu_layers)])
@@ -656,7 +695,7 @@ class LlamaCPPSubprocessNode:
             "min_p": samplers_dict.get("min_p", 0.05),
             "presence_penalty": samplers_dict.get("presence_penalty", 0.0),
             "frequency_penalty": samplers_dict.get("frequency_penalty", 0.0),
-            "repeat_penalty": samplers_dict.get("repeat_penalty", 1.0),
+            "repeat_penalty": samplers_dict.get("repeat_penalty", 1.1),
             "mirostat": samplers_dict.get("mirostat", 0),
             "mirostat_tau": samplers_dict.get("mirostat_tau", 5.0),
             "mirostat_eta": samplers_dict.get("mirostat_eta", 0.1),
@@ -759,8 +798,17 @@ class LlamaCPPUnloadNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "optional": {"any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст и т.д.)"})},
-            "required": {"unload_active": ("BOOLEAN", {"default": True, "label_on": "Unload", "label_off": "Pass only"})}
+            "optional": {
+                "any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст, латент и т.д.), чтобы заставить эту ноду дождаться выполнения предыдущих шагов перед выгрузкой."})
+            },
+            "required": {
+                "unload_active": ("BOOLEAN", {
+                    "default": True, 
+                    "label_on": "Unload", 
+                    "label_off": "Pass only",
+                    "tooltip": "Выгрузка активна. Включите, чтобы принудительно убить сервер Llama и освободить видеопамять (VRAM). Если выключить, нода просто пропустит сигнал дальше без выгрузки."
+                })
+            }
         }
 
     RETURN_TYPES = (ANY,)

@@ -295,6 +295,42 @@ class LlamaCPPAdvancedSamplersNode:
                     "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
                     "tooltip": "Форма кривой для сглаживания логитов."
                 }),
+                "min_p": ("FLOAT", {
+                    "default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Min-P sampling. 0.0 = disabled. Replaces tokens with probability lower than min_p * max_probability."
+                }),
+                "presence_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Penalizes new tokens based on whether they appear in the text so far."
+                }),
+                "frequency_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Penalizes new tokens based on their existing frequency in the text."
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Repetition penalty (1.0 = disabled)."
+                }),
+                "mirostat": ("INT", {
+                    "default": 0, "min": 0, "max": 2, "step": 1,
+                    "tooltip": "Mirostat sampling (0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0). Keeps perplexity constant."
+                }),
+                "mirostat_tau": ("FLOAT", {
+                    "default": 5.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "Mirostat target entropy (tau)."
+                }),
+                "mirostat_eta": ("FLOAT", {
+                    "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Mirostat learning rate (eta)."
+                }),
+                "tfs_z": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Tail Free Sampling (1.0 = disabled)."
+                }),
+                "typical_p": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Typical Sampling (1.0 = disabled)."
+                }),
             },
             "optional": {
                 "banned_tokens": ("STRING", {
@@ -309,7 +345,7 @@ class LlamaCPPAdvancedSamplersNode:
     FUNCTION = "get_samplers"
     CATEGORY = "LlamaCPP/Inference"
 
-    def get_samplers(self, dynatemp_range, dynatemp_exponent, xtc_probability, xtc_threshold, smoothing_factor, smoothing_curve, banned_tokens=""):
+    def get_samplers(self, dynatemp_range, dynatemp_exponent, xtc_probability, xtc_threshold, smoothing_factor, smoothing_curve, min_p, presence_penalty, frequency_penalty, repeat_penalty, mirostat, mirostat_tau, mirostat_eta, tfs_z, typical_p, banned_tokens=""):
         return ({
             "dynatemp_range": dynatemp_range,
             "dynatemp_exponent": dynatemp_exponent,
@@ -317,6 +353,15 @@ class LlamaCPPAdvancedSamplersNode:
             "xtc_threshold": xtc_threshold,
             "smoothing_factor": smoothing_factor,
             "smoothing_curve": smoothing_curve,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "repeat_penalty": repeat_penalty,
+            "mirostat": mirostat,
+            "mirostat_tau": mirostat_tau,
+            "mirostat_eta": mirostat_eta,
+            "tfs_z": tfs_z,
+            "typical_p": typical_p,
             "banned_tokens": banned_tokens
         },)
     
@@ -421,6 +466,10 @@ class LlamaCPPSubprocessNode:
                     "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
                     "tooltip": "Additional VRAM in GB to reserve on top of the model size to prevent ComfyUI OOMs."
                 }),
+                "flash_attention": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable Flash Attention (-fa). Significantly saves VRAM at large context sizes and speeds up generation."
+                }),
             }
         }
 
@@ -429,7 +478,7 @@ class LlamaCPPSubprocessNode:
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, context_quantization, memory_mode, gpu_layers, 
+    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", extra_samplers=None, extra_reserve_vram=0.6):
         
@@ -451,7 +500,7 @@ class LlamaCPPSubprocessNode:
         current_config = {
             "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, "ctx_q": context_quantization,
             "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
-            "args": extra_cli_args, "reasoning": reasoning
+            "args": extra_cli_args, "reasoning": reasoning, "flash_attn": flash_attention
         }
 
         # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
@@ -471,6 +520,9 @@ class LlamaCPPSubprocessNode:
             # Добавляем ключ -lv 4 для детального вывода памяти
             cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
             
+            if flash_attention:
+                cmd.extend(["-fa"])
+                
             if memory_mode in {"gpu_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["-ngl", str(gpu_layers)])
             if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
@@ -601,6 +653,15 @@ class LlamaCPPSubprocessNode:
             "xtc_threshold": samplers_dict.get("xtc_threshold", 0.1),
             "smoothing_factor": samplers_dict.get("smoothing_factor", 0.0),
             "smoothing_curve": samplers_dict.get("smoothing_curve", 1.0),
+            "min_p": samplers_dict.get("min_p", 0.05),
+            "presence_penalty": samplers_dict.get("presence_penalty", 0.0),
+            "frequency_penalty": samplers_dict.get("frequency_penalty", 0.0),
+            "repeat_penalty": samplers_dict.get("repeat_penalty", 1.0),
+            "mirostat": samplers_dict.get("mirostat", 0),
+            "mirostat_tau": samplers_dict.get("mirostat_tau", 5.0),
+            "mirostat_eta": samplers_dict.get("mirostat_eta", 0.1),
+            "tfs_z": samplers_dict.get("tfs_z", 1.0),
+            "typical_p": samplers_dict.get("typical_p", 1.0),
         }
 
         # ОБРАБОТКА ЗАПРЕЩЕННЫХ СЛОВ (LOGIT BIAS)

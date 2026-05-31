@@ -161,10 +161,10 @@ def ensure_llama_server_paths() -> str:
     return str(exe_path)
 
 # =======================================================================
-# 3. ОСНОВНАЯ ЛОГИКА И СЕРВЕР
+# 3. ОСНОВНАЯ ЛОГИКА И СЕРВЕРЫ
 # =======================================================================
 
-ACTIVE_SERVER = {}
+ACTIVE_SERVERS = {}
 ORIGINAL_EXTRA_RESERVED_VRAM = None
 MMPROJ_EMBEDDING_MISMATCH_RE = re.compile(
     r"mismatch between text model \(n_embd = (?P<model>\d+)\) and mmproj \(n_embd = (?P<mmproj>\d+)\)", flags=re.IGNORECASE
@@ -200,31 +200,53 @@ def tensors_to_base64_list(image_tensor, max_frames=8):
         b64_list.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
     return b64_list
 
-def kill_active_server():
-    global ACTIVE_SERVER, ORIGINAL_EXTRA_RESERVED_VRAM
-    if "process" in ACTIVE_SERVER and ACTIVE_SERVER["process"]:
-        try:
-            ACTIVE_SERVER["process"].kill()
-            ACTIVE_SERVER["process"].wait(timeout=5)
-        except: pass
-    if "log_file" in ACTIVE_SERVER and ACTIVE_SERVER["log_file"]:
-        try: ACTIVE_SERVER["log_file"].close()
-        except: pass
-    ACTIVE_SERVER = {}
+def update_global_vram_reservation():
+    global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
+    if ORIGINAL_EXTRA_RESERVED_VRAM is None:
+        ORIGINAL_EXTRA_RESERVED_VRAM = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
     
-    # Возвращаем исходное значение EXTRA_RESERVED_VRAM в ComfyUI
-    if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
-        try:
-            comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
-            print(f"[LlamaCPP] Восстановлено исходное значение EXTRA_RESERVED_VRAM: {ORIGINAL_EXTRA_RESERVED_VRAM / (1024**3):.2f} GB")
-        except Exception as e:
-            pass
-        ORIGINAL_EXTRA_RESERVED_VRAM = None
+    total_reserve_bytes = 0
+    for s_id, s_info in ACTIVE_SERVERS.items():
+        s_vram = s_info.get("vram_bytes", 0)
+        s_extra_reserve_vram_gb = s_info.get("extra_reserve_vram", 0.6)
+        s_extra_bytes = int(s_extra_reserve_vram_gb * (1024 ** 3))
+        total_reserve_bytes += (s_vram + s_extra_bytes)
         
-    print("[LlamaCPP] Модель выгружена, процесс завершен.")
+    if total_reserve_bytes > 0:
+        comfy.model_management.EXTRA_RESERVED_VRAM = total_reserve_bytes
+        print(f"[LlamaCPP] Суммарно зарезервировано VRAM для всех серверов: {total_reserve_bytes / (1024**3):.2f} GB")
+    else:
+        if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
+            try:
+                comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
+                print(f"[LlamaCPP] Все серверы остановлены. Восстановлено исходное значение EXTRA_RESERVED_VRAM: {ORIGINAL_EXTRA_RESERVED_VRAM / (1024**3):.2f} GB")
+            except Exception:
+                pass
+            ORIGINAL_EXTRA_RESERVED_VRAM = None
 
-# Убиваем процесс при полном закрытии ComfyUI
-atexit.register(kill_active_server)
+def kill_server(server_id: str):
+    global ACTIVE_SERVERS
+    if server_id in ACTIVE_SERVERS:
+        s_info = ACTIVE_SERVERS[server_id]
+        if s_info.get("process"):
+            try:
+                s_info["process"].kill()
+                s_info["process"].wait(timeout=5)
+            except Exception: pass
+        if s_info.get("log_file"):
+            try: s_info["log_file"].close()
+            except Exception: pass
+        del ACTIVE_SERVERS[server_id]
+        print(f"[LlamaCPP] Сервер '{server_id}' выгружен, процесс завершен.")
+        update_global_vram_reservation()
+
+def kill_all_servers():
+    global ACTIVE_SERVERS
+    for server_id in list(ACTIVE_SERVERS.keys()):
+        kill_server(server_id)
+
+# Убиваем все процессы при полном закрытии ComfyUI
+atexit.register(kill_all_servers)
 
 if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
     comfy.model_management._original_unload_all_models_llamacpp = comfy.model_management.unload_all_models
@@ -238,7 +260,7 @@ if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
             is_node_execution = False
 
         if not is_node_execution:
-            kill_active_server()
+            kill_all_servers()
             
         return comfy.model_management._original_unload_all_models_llamacpp(*args, **kwargs)
     
@@ -249,18 +271,22 @@ if not hasattr(execution.PromptExecutor, "_original_execute_llamacpp"):
     execution.PromptExecutor._original_execute_llamacpp = execution.PromptExecutor.execute
 
     def hooked_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        # Ищем нашу ноду в списке узлов, которые сейчас будут выполняться
-        has_llama = False
+        # Ищем наши ноды в списке узлов, которые сейчас будут выполняться
+        active_server_ids_in_prompt = set()
         if isinstance(prompt, dict):
             for node_id, node_info in prompt.items():
                 if isinstance(node_info, dict) and node_info.get("class_type") == "LlamaCPP_Subprocess":
-                    has_llama = True
-                    break
+                    inputs = node_info.get("inputs", {})
+                    s_id = inputs.get("server_id", "default")
+                    active_server_ids_in_prompt.add(s_id)
         
-        # Если мы нажали "Queue Prompt", а ноды LlamaCPP_Subprocess в этом воркфлоу НЕТ —
-        # значит мы переключились на другой процесс. Смело выгружаем модель и освобождаем VRAM!
-        if not has_llama:
-            kill_active_server()
+        # Если мы нажали "Queue Prompt", а каких-то серверов в этом воркфлоу НЕТ —
+        # значит мы переключились на другой процесс или убрали эти ноды. Смело выгружаем лишние модели!
+        global ACTIVE_SERVERS
+        for s_id in list(ACTIVE_SERVERS.keys()):
+            if s_id not in active_server_ids_in_prompt:
+                print(f"[LlamaCPP] Сервер '{s_id}' отсутствует в текущем воркфлоу. Выгрузка...")
+                kill_server(s_id)
 
         return self._original_execute_llamacpp(prompt, prompt_id, extra_data, execute_outputs)
 
@@ -498,6 +524,10 @@ class LlamaCPPSubprocessNode:
                     "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
                     "tooltip": "Дополнительный 'виртуальный' резерв памяти (в ГБ), который мы сообщаем ComfyUI. Помогает избежать ошибок Out Of Memory (OOM) во время генерации картинок."
                 }),
+                "server_id": ("STRING", {
+                    "default": "default",
+                    "tooltip": "Уникальный идентификатор сервера. Позволяет одновременно запускать несколько разных моделей Llama."
+                }),
             }
         }
 
@@ -506,11 +536,11 @@ class LlamaCPPSubprocessNode:
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
-    def generate_text(self, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
+    def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6):
         
-        global ACTIVE_SERVER, ORIGINAL_EXTRA_RESERVED_VRAM
+        global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
         if model == NO_MODELS_FOUND:
             raise ValueError("No models found. Please put .gguf files in ComfyUI/models/LLM")
@@ -534,18 +564,18 @@ class LlamaCPPSubprocessNode:
         }
 
         # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
-        if ACTIVE_SERVER:
-            proc = ACTIVE_SERVER.get("process")
+        if server_id in ACTIVE_SERVERS:
+            proc = ACTIVE_SERVERS[server_id].get("process")
             if proc and proc.poll() is not None:
-                print(f"\n[LlamaCPP] Процесс сервера упал/убит извне (Код {proc.returncode}). Авто-перезапуск...")
-                kill_active_server()
+                print(f"\n[LlamaCPP] Процесс сервера '{server_id}' упал/убит извне (Код {proc.returncode}). Авто-перезапуск...")
+                kill_server(server_id)
 
-        if ACTIVE_SERVER.get("config") != current_config and "process" in ACTIVE_SERVER:
-            print(f"\n[LlamaCPP] Изменение настроек модели. Выгрузка старой...")
-            kill_active_server()
+        if server_id in ACTIVE_SERVERS and ACTIVE_SERVERS[server_id].get("config") != current_config:
+            print(f"\n[LlamaCPP] Изменение настроек модели для сервера '{server_id}'. Выгрузка старой...")
+            kill_server(server_id)
 
         # START SERVER IF NEEDED
-        if not ACTIVE_SERVER:
+        if server_id not in ACTIVE_SERVERS:
             port = get_free_port()
             # Добавляем ключ -lv 4 для детального вывода памяти
             cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
@@ -576,8 +606,8 @@ class LlamaCPPSubprocessNode:
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
             if extra_cli_args: cmd.extend(extra_cli_args.split())
 
-            print(f"\n[LlamaCPP] Запуск сервера: {' '.join(cmd)}")
-            log_file_path = os.path.join(os.getcwd(), "llama_server_debug.log")
+            print(f"\n[LlamaCPP] Запуск сервера '{server_id}': {' '.join(cmd)}")
+            log_file_path = os.path.join(os.getcwd(), f"llama_server_{server_id}_debug.log")
             log_file = open(log_file_path, "w", encoding="utf-8")
             
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore")
@@ -623,28 +653,30 @@ class LlamaCPPSubprocessNode:
                         f"(модель n_embd={mm_match.group('model')}, mmproj n_embd={mm_match.group('mmproj')}). "
                         "Выберите mmproj, соответствующий архитектуре модели."
                     )
-                raise Exception(f"[LlamaCPP ERROR] Сервер не запустился. Лог: {err_text[-1000:]}")
+                raise Exception(f"[LlamaCPP ERROR] Сервер '{server_id}' не запустился. Лог: {err_text[-1000:]}")
             
-            ACTIVE_SERVER = {"process": process, "config": current_config, "port": port, "log_file": log_file}
-            print(f"[LlamaCPP] Сервер готов на порту {port}.")
-
-            if ORIGINAL_EXTRA_RESERVED_VRAM is None:
-                ORIGINAL_EXTRA_RESERVED_VRAM = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
+            ACTIVE_SERVERS[server_id] = {
+                "process": process, 
+                "config": current_config, 
+                "port": port, 
+                "log_file": log_file,
+                "vram_bytes": 0,
+                "extra_reserve_vram": extra_reserve_vram
+            }
+            print(f"[LlamaCPP] Сервер '{server_id}' готов на порту {port}.")
 
             # Даем потоку долю секунды на обработку последних строк перед тем как забрать результат
             time.sleep(0.2)
             exact_vram_bytes = int(startup_vram_mb[0] * 1024 * 1024)
 
             if exact_vram_bytes > 0:
+                ACTIVE_SERVERS[server_id]["vram_bytes"] = exact_vram_bytes
                 exact_vram_gb = exact_vram_bytes / (1024 ** 3)
-                total_reserve_gb = exact_vram_gb + extra_reserve_vram
-                comfy.model_management.EXTRA_RESERVED_VRAM = int(total_reserve_gb * (1024 ** 3))
-                print(f"[LlamaCPP] VRAM зарезервировано: {total_reserve_gb:.2f} GB (Модель: {exact_vram_gb:.2f} GB + Буфер: {extra_reserve_vram:.2f} GB)")
+                print(f"[LlamaCPP] Извлечено потребление VRAM для сервера '{server_id}': {exact_vram_gb:.2f} GB")
+                update_global_vram_reservation()
             else:
-                print("[LlamaCPP] Не удалось извлечь потребление VRAM из потока. Используются стандартные лимиты памяти.")
-                if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
-                    comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
-                    ORIGINAL_EXTRA_RESERVED_VRAM = None
+                print(f"[LlamaCPP] Не удалось извлечь потребление VRAM из потока для сервера '{server_id}'. Используются стандартные лимиты памяти.")
+                update_global_vram_reservation()
 
         # COMPILE SYSTEM PROMPT
         sys_str = ""
@@ -710,7 +742,7 @@ class LlamaCPPSubprocessNode:
                 word = word.strip()
                 if not word: continue
                 
-                tok_url = f"http://127.0.0.1:{ACTIVE_SERVER['port']}/tokenize"
+                tok_url = f"http://127.0.0.1:{ACTIVE_SERVERS[server_id]['port']}/tokenize"
                 tok_data = json.dumps({"content": word}).encode('utf-8')
                 tok_req = urllib.request.Request(tok_url, data=tok_data, headers={'Content-Type': 'application/json'})
                 try:
@@ -726,7 +758,7 @@ class LlamaCPPSubprocessNode:
                 payload["logit_bias"] = logit_bias
 
         # SEND REQUEST
-        url = f"http://127.0.0.1:{ACTIVE_SERVER['port']}/v1/chat/completions"
+        url = f"http://127.0.0.1:{ACTIVE_SERVERS[server_id]['port']}/v1/chat/completions"
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
         
@@ -739,7 +771,7 @@ class LlamaCPPSubprocessNode:
                 for line in response:
                     # ComfyUI Interrupt Support
                     if comfy.model_management.processing_interrupted():
-                        print("\n[LlamaCPP] Генерация отменена пользователем (Interrupt).")
+                        print(f"\n[LlamaCPP] Генерация на сервере '{server_id}' отменена пользователем (Interrupt).")
                         clean_text += "\n\n[Генерация прервана]"
                         break
                         
@@ -789,7 +821,7 @@ class LlamaCPPSubprocessNode:
                     clean_text = "[ОШИБКА: Модели не хватило max_tokens для ответа.]\n" + clean_text
 
         if not keep_model_loaded:
-            kill_active_server()
+            kill_server(server_id)
 
         return (clean_text.strip(), thoughts_text.strip(), perf_text)
 
@@ -807,6 +839,10 @@ class LlamaCPPUnloadNode:
                     "label_on": "Unload", 
                     "label_off": "Pass only",
                     "tooltip": "Выгрузка активна. Включите, чтобы принудительно убить сервер Llama и освободить видеопамять (VRAM). Если выключить, нода просто пропустит сигнал дальше без выгрузки."
+                }),
+                "server_id": ("STRING", {
+                    "default": "all",
+                    "tooltip": "Идентификатор сервера для выгрузки. Укажите 'all' чтобы выгрузить все запущенные серверы."
                 })
             }
         }
@@ -816,10 +852,14 @@ class LlamaCPPUnloadNode:
     CATEGORY = "LlamaCPP/Memory"
     OUTPUT_NODE = True
 
-    def unload_models(self, unload_active, any_input=None):
+    def unload_models(self, unload_active, server_id="all", any_input=None):
         if unload_active:
-            print("\n[LlamaCPP] Нода инициировала выгрузку...")
-            kill_active_server()
+            if server_id == "all" or not server_id.strip():
+                print("\n[LlamaCPP] Нода инициировала выгрузку всех серверов...")
+                kill_all_servers()
+            else:
+                print(f"\n[LlamaCPP] Нода инициировала выгрузку сервера '{server_id}'...")
+                kill_server(server_id)
         return (any_input, )
 
 NODE_CLASS_MAPPINGS = {

@@ -97,7 +97,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b9305"
+LLAMA_CPP_RELEASE_TAG = "b9518"
 RELEASE_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_RELEASE_TAG}"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
@@ -165,6 +165,7 @@ def ensure_llama_server_paths() -> str:
 # =======================================================================
 
 ACTIVE_SERVERS = {}
+CHAT_SESSIONS = {}  # Глобальный реестр для хранения истории чат-сессий
 ORIGINAL_EXTRA_RESERVED_VRAM = None
 MMPROJ_EMBEDDING_MISMATCH_RE = re.compile(
     r"mismatch between text model \(n_embd = (?P<model>\d+)\) and mmproj \(n_embd = (?P<mmproj>\d+)\)", flags=re.IGNORECASE
@@ -266,7 +267,7 @@ if not hasattr(comfy.model_management, "_original_unload_all_models_llamacpp"):
     
     comfy.model_management.unload_all_models = hooked_unload_all_models_llamacpp
 
-# 3. Перехват запуска графа: Авто-очистка при переключении на воркфлоу без Llama
+# Перехват запуска графа: Авто-очистка при переключении на воркфлоу без Llama
 if not hasattr(execution.PromptExecutor, "_original_execute_llamacpp"):
     execution.PromptExecutor._original_execute_llamacpp = execution.PromptExecutor.execute
 
@@ -291,6 +292,10 @@ if not hasattr(execution.PromptExecutor, "_original_execute_llamacpp"):
         return self._original_execute_llamacpp(prompt, prompt_id, extra_data, execute_outputs)
 
     execution.PromptExecutor.execute = hooked_execute
+
+# =======================================================================
+# 4. УЗЛЫ ИНТЕРФЕЙСА
+# =======================================================================
 
 class LlamaCPPAdvancedSamplersNode:
     @classmethod
@@ -390,7 +395,109 @@ class LlamaCPPAdvancedSamplersNode:
             "typical_p": typical_p,
             "banned_tokens": banned_tokens
         },)
+
+
+class LlamaCPPChatHistoryNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "session_id": ("STRING", {
+                    "default": "session_1",
+                    "tooltip": "Уникальный идентификатор сессии чата. Измените имя, чтобы начать независимый параллельный диалог."
+                }),
+                "reset_session": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Очистить историю этой сессии чата и начать заново с системным промптом."
+                }),
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "You are a helpful assistant.",
+                    "tooltip": "Системная роль и инструкции для модели в рамках этого чата."
+                })
+            }
+        }
+
+    RETURN_TYPES = ("LLAMA_CHAT_HISTORY", "STRING")
+    RETURN_NAMES = ("chat_history", "formatted_history")
+    FUNCTION = "get_history"
+    CATEGORY = "LlamaCPP/Chat"
+
+    def get_history(self, session_id, reset_session, system_prompt):
+        global CHAT_SESSIONS
+        s_id = session_id.strip() or "default"
+        
+        # Если сессии нет или нажат сброс
+        if reset_session or s_id not in CHAT_SESSIONS:
+            CHAT_SESSIONS[s_id] = []
+            if system_prompt.strip():
+                CHAT_SESSIONS[s_id].append({
+                    "role": "system", 
+                    "content": system_prompt.strip()
+                })
+            print(f"[LlamaCPP] Сессия чата '{s_id}' инициализирована/сброшена.")
+
+        messages = CHAT_SESSIONS[s_id]
+        
+        # Формируем читаемую строку для вывода
+        formatted_lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown").upper()
+            content = msg.get("content", "")
+            
+            if isinstance(content, list):
+                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                text_content = " ".join(text_parts).strip()
+            else:
+                text_content = str(content).strip()
+                
+            if role == "SYSTEM" and len(text_content) > 150:
+                text_content = text_content[:150] + "..."
+                
+            formatted_lines.append(f"[{role}]: {text_content}")
+            
+        formatted_text = "\n\n".join(formatted_lines)
+        
+        return ({"session_id": s_id, "messages": messages}, formatted_text)
+
+
+class LlamaCPPFormatHistoryNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "chat_history": ("LLAMA_CHAT_HISTORY", {
+                    "tooltip": "Контейнер истории диалога для форматирования в текст."
+                })
+            }
+        }
     
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("formatted_history",)
+    FUNCTION = "format_history"
+    CATEGORY = "LlamaCPP/Chat"
+
+    def format_history(self, chat_history):
+        if not chat_history or "messages" not in chat_history:
+            return ("",)
+        
+        messages = chat_history["messages"]
+        formatted_lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown").upper()
+            content = msg.get("content", "")
+            
+            if isinstance(content, list):
+                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                text_content = " ".join(text_parts).strip()
+            else:
+                text_content = str(content).strip()
+                
+            formatted_lines.append(f"[{role}]: {text_content}")
+            
+        return ("\n\n".join(formatted_lines),)
+
+
 class LlamaCPPSubprocessNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -493,6 +600,9 @@ class LlamaCPPSubprocessNode:
                 "extra_samplers": ("LLAMA_SAMPLERS", {
                     "tooltip": "Подключите сюда выход ноды LlamaCPP Advanced Samplers для тонкой настройки вероятностей."
                 }),
+                "chat_history": ("LLAMA_CHAT_HISTORY", {
+                    "tooltip": "Подключите историю сессии чата, чтобы включить режим памяти и вести диалог с моделью."
+                }),
                 "system_prompt_preset": (system_prompt_options(), {
                     "default": NO_SYSTEM_PROMPT,
                     "tooltip": "Шаблон системного промпта. Ваши .txt файлы из папки ComfyUI/models/LLM/prompts появятся в этом списке."
@@ -531,14 +641,15 @@ class LlamaCPPSubprocessNode:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("text", "thoughts", "perf")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "LLAMA_CHAT_HISTORY")
+    RETURN_NAMES = ("text", "thoughts", "perf", "chat_history")
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
     def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6):
+                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
+                      chat_history=None):
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -577,8 +688,7 @@ class LlamaCPPSubprocessNode:
         # START SERVER IF NEEDED
         if server_id not in ACTIVE_SERVERS:
             port = get_free_port()
-            # Добавляем ключ -lv 4 для детального вывода памяти
-            cmd =[exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
+            cmd = [exe_path, "-m", m_path, "-c", str(ctx_size), "--port", str(port), "-lv", "4"]
             
             if flash_attention:
                 cmd.extend(["-fa", "on"])
@@ -678,36 +788,55 @@ class LlamaCPPSubprocessNode:
                 print(f"[LlamaCPP] Не удалось извлечь потребление VRAM из потока для сервера '{server_id}'. Используются стандартные лимиты памяти.")
                 update_global_vram_reservation()
 
-        # COMPILE SYSTEM PROMPT
-        sys_str = ""
-        if system_prompt_preset != NO_SYSTEM_PROMPT:
-            preset_path = folder_paths.get_full_path(PROMPT_FOLDER, system_prompt_preset)
-            if preset_path and os.path.exists(preset_path):
-                with open(preset_path, "r", encoding="utf-8") as f:
-                    sys_str += f.read() + "\n"
-        if system_prompt_text.strip():
-            sys_str += system_prompt_text
+        # ПОДГОТОВКА СТРУКТУРЫ MESSAGES
+        if chat_history is not None:
+            # Если подключен чат, берём всю имеющуюся историю из этой сессии
+            messages = list(chat_history.get("messages", []))
+        else:
+            # Иначе строим один Turn (one-shot режим)
+            messages = []
+            sys_str = ""
+            if system_prompt_preset != NO_SYSTEM_PROMPT:
+                preset_path = folder_paths.get_full_path(PROMPT_FOLDER, system_prompt_preset)
+                if preset_path and os.path.exists(preset_path):
+                    with open(preset_path, "r", encoding="utf-8") as f:
+                        sys_str += f.read() + "\n"
+            if system_prompt_text.strip():
+                sys_str += system_prompt_text
 
-        # PREPARE MESSAGES
-        messages =[]
-        if sys_str.strip():
-            messages.append({"role": "system", "content": sys_str.strip()})
+            if sys_str.strip():
+                messages.append({"role": "system", "content": sys_str.strip()})
 
-        user_content =[]
-        if audio_video_path and os.path.exists(audio_video_path):
-            user_content.append({"type": "text", "text": f"Media file attached: {audio_video_path}\n"})
+        # Определяем, является ли это уточняющим вопросом в уже идущем диалоге
+        is_followup = any(m.get("role") == "user" for m in messages)
+
+        # Добавление реплики пользователя
+        user_content = []
         
-        if image is not None:
-            if not mm_path:
-                print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
-            else:
-                b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
-                if len(b64_images) > 1:
-                    user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
-                for b64_img in b64_images:
-                    user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
+        # Чтобы модель не "сбрасывала" контекст и не описывала картинку заново с нуля,
+        # мы прикрепляем картинки и видео ТОЛЬКО к самому первому сообщению в сессии.
+        if not is_followup:
+            if audio_video_path and os.path.exists(audio_video_path):
+                user_content.append({"type": "text", "text": f"Media file attached: {audio_video_path}\n"})
+            
+            if image is not None:
+                if not mm_path:
+                    print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
+                else:
+                    b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
+                    if len(b64_images) > 1:
+                        user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
+                    for b64_img in b64_images:
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
 
         user_content.append({"type": "text", "text": prompt})
+
+        # Фикс: если сообщение содержит только текст (уточнение),
+        # передаем его простой строкой. Многие модели сходят с ума и забывают, 
+        # что это диалог, если история состоит из сложных multi-modal словарей.
+        if len(user_content) == 1 and user_content[0].get("type") == "text":
+            user_content = user_content[0]["text"]
+
         messages.append({"role": "user", "content": user_content})
 
         # ИЗВЛЕКАЕМ ДОПОЛНИТЕЛЬНЫЕ СЕМПЛЕРЫ
@@ -788,13 +917,6 @@ class LlamaCPPSubprocessNode:
                             clean_text += delta.get("content", "") or ""
                             thoughts_text += delta.get("reasoning_content", "") or ""
                         
-                        if "usage" in chunk and "completion_tokens" in chunk["usage"]:
-                            usage = chunk.get("usage", {})
-                            # В llama-server потоке иногда пробрасывается метрика timings
-                            # Для точной метрики мы можем использовать данные из лога или usage
-                            pass
-                            
-                        # Специфичные тайминги от llama.cpp
                         if "timings" in chunk:
                             t_prompt = chunk["timings"].get("prompt_per_second", 0)
                             t_gen = chunk["timings"].get("predicted_per_second", 0)
@@ -820,10 +942,23 @@ class LlamaCPPSubprocessNode:
                     clean_text = re.sub(r'<think>.*', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
                     clean_text = "[ОШИБКА: Модели не хватило max_tokens для ответа.]\n" + clean_text
 
+        # СОХРАНЕНИЕ В ИСТОРИЮ (если режим чата активен)
+        if chat_history is not None:
+            orig_messages = chat_history.get("messages")
+            if isinstance(orig_messages, list):
+                orig_messages.append({"role": "user", "content": user_content})
+                orig_messages.append({"role": "assistant", "content": clean_text.strip()})
+            out_history = chat_history
+        else:
+            out_history = {
+                "session_id": "single_turn", 
+                "messages": messages + [{"role": "assistant", "content": clean_text.strip()}]
+            }
+
         if not keep_model_loaded:
             kill_server(server_id)
 
-        return (clean_text.strip(), thoughts_text.strip(), perf_text)
+        return (clean_text.strip(), thoughts_text.strip(), perf_text, out_history)
 
 
 class LlamaCPPUnloadNode:
@@ -831,14 +966,14 @@ class LlamaCPPUnloadNode:
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "any_input": (ANY, {"tooltip": "Подключите сюда что угодно (картинку, текст, латент и т.д.), чтобы заставить эту ноду дождаться выполнения предыдущих шагов перед выгрузкой."})
+                "any_input": (ANY, {"tooltip": "Подключите сюда что угодно, чтобы заставить эту ноду дождаться выполнения предыдущих шагов перед выгрузкой."})
             },
             "required": {
                 "unload_active": ("BOOLEAN", {
                     "default": True, 
                     "label_on": "Unload", 
                     "label_off": "Pass only",
-                    "tooltip": "Выгрузка активна. Включите, чтобы принудительно убить сервер Llama и освободить видеопамять (VRAM). Если выключить, нода просто пропустит сигнал дальше без выгрузки."
+                    "tooltip": "Выгрузка активна. Включите, чтобы принудительно убить сервер Llama и освободить видеопамять (VRAM)."
                 }),
                 "server_id": ("STRING", {
                     "default": "all",
@@ -862,14 +997,22 @@ class LlamaCPPUnloadNode:
                 kill_server(server_id)
         return (any_input, )
 
+# =======================================================================
+# 5. РЕГИСТРАЦИЯ КЛАССОВ И ИМЕН В COMFYUI
+# =======================================================================
+
 NODE_CLASS_MAPPINGS = {
     "LlamaCPP_AdvancedSamplers": LlamaCPPAdvancedSamplersNode,
     "LlamaCPP_Subprocess": LlamaCPPSubprocessNode,
-    "LlamaCPP_UnloadAll": LlamaCPPUnloadNode
+    "LlamaCPP_UnloadAll": LlamaCPPUnloadNode,
+    "LlamaCPP_ChatHistory": LlamaCPPChatHistoryNode,
+    "LlamaCPP_FormatHistory": LlamaCPPFormatHistoryNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaCPP_AdvancedSamplers": "LlamaCPP Advanced Samplers",
     "LlamaCPP_Subprocess": "LlamaCPP Server Model",
-    "LlamaCPP_UnloadAll": "LlamaCPP Unload All"
+    "LlamaCPP_UnloadAll": "LlamaCPP Unload All",
+    "LlamaCPP_ChatHistory": "LlamaCPP Chat History",
+    "LlamaCPP_FormatHistory": "LlamaCPP Format History"
 }

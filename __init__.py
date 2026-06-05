@@ -414,6 +414,27 @@ class LlamaCPPChatHistoryNode:
                     "multiline": True,
                     "default": "You are a helpful assistant.",
                     "tooltip": "Системная роль и инструкции для модели в рамках этого чата."
+                }),
+                "context_mode": (["keep_all", "prune_middle", "auto_summarize"], {
+                    "default": "keep_all",
+                    "tooltip": "Режим контроля контекста: keep_all (помнить всё), prune_middle (удалять середину), auto_summarize (умное сжатие в архив)."
+                }),
+                "keep_first_n": ("INT", {
+                    "default": 2, "min": 1, "max": 10,
+                    "tooltip": "Сколько самых первых сообщений (включая картинку) НИКОГДА не удалять."
+                }),
+                "keep_recent_n": ("INT", {
+                    "default": 4, "min": 1, "max": 20,
+                    "tooltip": "Сколько самых свежих сообщений перед новым запросом оставлять нетронутыми."
+                }),
+                "summarize_prompt": ("STRING", {
+                    "multiline": True, 
+                    "default": "Summarize the following conversation in detail. Preserve key facts, visual descriptions, character rules, and exact quotes if important.",
+                    "tooltip": "Промпт для режима auto_summarize (на английском). Укажите, что именно модели нужно сохранить при архивации истории."
+                }),
+                "summary_max_tokens": ("INT", {
+                    "default": 500, "min": 50, "max": 4096,
+                    "tooltip": "Максимальный размер архива (саммари) в токенах."
                 })
             }
         }
@@ -423,11 +444,10 @@ class LlamaCPPChatHistoryNode:
     FUNCTION = "get_history"
     CATEGORY = "LlamaCPP/Chat"
 
-    def get_history(self, session_id, reset_session, system_prompt):
+    def get_history(self, session_id, reset_session, system_prompt, context_mode="keep_all", keep_first_n=2, keep_recent_n=4, summarize_prompt="", summary_max_tokens=500):
         global CHAT_SESSIONS
         s_id = session_id.strip() or "default"
         
-        # Если сессии нет или нажат сброс
         if reset_session or s_id not in CHAT_SESSIONS:
             CHAT_SESSIONS[s_id] = []
             if system_prompt.strip():
@@ -439,7 +459,6 @@ class LlamaCPPChatHistoryNode:
 
         messages = CHAT_SESSIONS[s_id]
         
-        # Формируем читаемую строку для вывода
         formatted_lines = []
         for msg in messages:
             role = msg.get("role", "unknown").upper()
@@ -458,7 +477,13 @@ class LlamaCPPChatHistoryNode:
             
         formatted_text = "\n\n".join(formatted_lines)
         
-        return ({"session_id": s_id, "messages": messages}, formatted_text)
+        chat_config = {
+            "context_mode": context_mode, "keep_first_n": keep_first_n, 
+            "keep_recent_n": keep_recent_n, "summarize_prompt": summarize_prompt, 
+            "summary_max_tokens": summary_max_tokens
+        }
+        
+        return ({"session_id": s_id, "messages": messages, "config": chat_config}, formatted_text)
 
 
 class LlamaCPPFormatHistoryNode:
@@ -641,8 +666,8 @@ class LlamaCPPSubprocessNode:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "LLAMA_CHAT_HISTORY")
-    RETURN_NAMES = ("text", "thoughts", "perf", "chat_history")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "LLAMA_CHAT_HISTORY")
+    RETURN_NAMES = ("text", "thoughts", "perf", "usage_stats", "chat_history")
     FUNCTION = "generate_text"
     CATEGORY = "LlamaCPP/Inference"
 
@@ -788,12 +813,54 @@ class LlamaCPPSubprocessNode:
                 print(f"[LlamaCPP] Не удалось извлечь потребление VRAM из потока для сервера '{server_id}'. Используются стандартные лимиты памяти.")
                 update_global_vram_reservation()
 
-        # ПОДГОТОВКА СТРУКТУРЫ MESSAGES
+        # ПОДГОТОВКА СТРУКТУРЫ MESSAGES И СЖАТИЕ КОНТЕКСТА
+        chat_config = {}
         if chat_history is not None:
-            # Если подключен чат, берём всю имеющуюся историю из этой сессии
             messages = list(chat_history.get("messages", []))
+            chat_config = chat_history.get("config", {})
+            c_mode = chat_config.get("context_mode", "keep_all")
+            k_first = chat_config.get("keep_first_n", 2)
+            k_recent = chat_config.get("keep_recent_n", 4)
+            
+            if c_mode != "keep_all" and len(messages) > k_first + k_recent:
+                if c_mode == "prune_middle":
+                    messages = messages[:k_first] + messages[-k_recent:]
+                    print(f"[LlamaCPP] Контекст усечен (prune_middle). Сохранено сообщений: {len(messages)}")
+                    
+                elif c_mode == "auto_summarize":
+                    middle_msgs = messages[k_first:-k_recent]
+                    if middle_msgs:
+                        print("[LlamaCPP] Запуск умного сжатия контекста (auto_summarize)...")
+                        middle_text = ""
+                        for m in middle_msgs:
+                            role = m.get("role", "unknown").upper()
+                            content = m.get("content", "")
+                            if isinstance(content, list):
+                                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                                content_str = " ".join(text_parts).strip()
+                            else:
+                                content_str = str(content).strip()
+                            middle_text += f"[{role}]: {content_str}\n\n"
+
+                        sum_payload = {
+                            "messages": [
+                                {"role": "system", "content": chat_config.get("summarize_prompt", "Summarize the conversation.")},
+                                {"role": "user", "content": middle_text}
+                            ],
+                            "temperature": 0.3,
+                            "max_tokens": chat_config.get("summary_max_tokens", 500),
+                            "stream": False
+                        }
+                        try:
+                            sum_req = urllib.request.Request(f"http://127.0.0.1:{ACTIVE_SERVERS[server_id]['port']}/v1/chat/completions", data=json.dumps(sum_payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
+                            with urllib.request.urlopen(sum_req) as sum_res:
+                                sum_data = json.loads(sum_res.read().decode('utf-8'))
+                                summary_text = sum_data["choices"][0]["message"]["content"].strip()
+                                messages = messages[:k_first] + [{"role": "system", "content": f"[SYSTEM NOTE: ARCHIVED PREVIOUS EVENTS]\n{summary_text}"}] + messages[-k_recent:]
+                                print("[LlamaCPP] Сжатие успешно завершено.")
+                        except Exception as e:
+                            print(f"[LlamaCPP Warning] Ошибка при сжатии контекста: {e}")
         else:
-            # Иначе строим один Turn (one-shot режим)
             messages = []
             sys_str = ""
             if system_prompt_preset != NO_SYSTEM_PROMPT:
@@ -894,11 +961,13 @@ class LlamaCPPSubprocessNode:
         clean_text = ""
         thoughts_text = ""
         perf_text = ""
+        usage_stats = "No usage data"
+        prompt_tokens = 0
+        completion_tokens = 0
 
         try:
             with urllib.request.urlopen(req) as response:
                 for line in response:
-                    # ComfyUI Interrupt Support
                     if comfy.model_management.processing_interrupted():
                         print(f"\n[LlamaCPP] Генерация на сервере '{server_id}' отменена пользователем (Interrupt).")
                         clean_text += "\n\n[Генерация прервана]"
@@ -917,10 +986,19 @@ class LlamaCPPSubprocessNode:
                             clean_text += delta.get("content", "") or ""
                             thoughts_text += delta.get("reasoning_content", "") or ""
                         
+                        if "usage" in chunk and chunk["usage"]:
+                            usage = chunk["usage"]
+                            prompt_tokens = usage.get("prompt_tokens", 0)
+                            completion_tokens = usage.get("completion_tokens", 0)
+                            ctx_total = prompt_tokens + completion_tokens
+                            ctx_pct = (ctx_total / ctx_size * 100) if ctx_size > 0 else 0
+                            usage_stats = f"Prompt Tokens: {prompt_tokens}\nCompletion Tokens: {completion_tokens}\nTotal Context: {ctx_total} / {ctx_size} ({ctx_pct:.1f}%)"
+
                         if "timings" in chunk:
                             t_prompt = chunk["timings"].get("prompt_per_second", 0)
                             t_gen = chunk["timings"].get("predicted_per_second", 0)
-                            perf_text = f"Prompt: {t_prompt:.1f} t/s | Generation: {t_gen:.1f} t/s"
+                            ctx_info = f"Ctx: {prompt_tokens+completion_tokens}/{ctx_size} " if prompt_tokens else ""
+                            perf_text = f"{ctx_info}| P: {t_prompt:.1f} t/s | G: {t_gen:.1f} t/s"
                             
                     except json.JSONDecodeError: pass
 
@@ -929,7 +1007,6 @@ class LlamaCPPSubprocessNode:
         except Exception as e:
             clean_text = f"Сетевая ошибка: {e}"
 
-        # Fallback regex parsing (if model puts <think> in main content instead of reasoning_content)
         if "<think>" in clean_text:
             think_match = re.search(r'<think>(.*?)</think>', clean_text, flags=re.DOTALL | re.IGNORECASE)
             if think_match:
@@ -942,13 +1019,15 @@ class LlamaCPPSubprocessNode:
                     clean_text = re.sub(r'<think>.*', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
                     clean_text = "[ОШИБКА: Модели не хватило max_tokens для ответа.]\n" + clean_text
 
-        # СОХРАНЕНИЕ В ИСТОРИЮ (если режим чата активен)
+        # СОХРАНЕНИЕ В ИСТОРИЮ (С учетом усечений)
         if chat_history is not None:
-            orig_messages = chat_history.get("messages")
-            if isinstance(orig_messages, list):
-                orig_messages.append({"role": "user", "content": user_content})
-                orig_messages.append({"role": "assistant", "content": clean_text.strip()})
-            out_history = chat_history
+            s_id = chat_history.get("session_id", "default")
+            global CHAT_SESSIONS
+            if s_id in CHAT_SESSIONS:
+                # В messages уже лежит реплика пользователя, добавляем только ответ модели
+                CHAT_SESSIONS[s_id] = messages + [{"role": "assistant", "content": clean_text.strip()}]
+            
+            out_history = {"session_id": s_id, "messages": CHAT_SESSIONS[s_id], "config": chat_config}
         else:
             out_history = {
                 "session_id": "single_turn", 
@@ -958,7 +1037,7 @@ class LlamaCPPSubprocessNode:
         if not keep_model_loaded:
             kill_server(server_id)
 
-        return (clean_text.strip(), thoughts_text.strip(), perf_text, out_history)
+        return (clean_text.strip(), thoughts_text.strip(), perf_text, usage_stats, out_history)
 
 
 class LlamaCPPUnloadNode:

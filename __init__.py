@@ -874,8 +874,11 @@ class LlamaCPPSubprocessNode:
             if sys_str.strip():
                 messages.append({"role": "system", "content": sys_str.strip()})
 
-        # Определяем, является ли это уточняющим вопросом в уже идущем диалоге
-        is_followup = any(m.get("role") == "user" for m in messages)
+        #  Определяем, является ли это продолжением диалога, строго ДО усечения истории
+        is_followup = False
+        if chat_history is not None:
+            orig_history = chat_history.get("messages", [])
+            is_followup = any(m.get("role") == "user" for m in orig_history)
 
         # Добавление реплики пользователя
         user_content = []
@@ -914,6 +917,7 @@ class LlamaCPPSubprocessNode:
             "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
             "top_k": top_k, "top_p": top_p, "seed": normalize_llama_seed(seed),
             "stream": True,
+            "stream_options": {"include_usage": True},
             "dynatemp_range": samplers_dict.get("dynatemp_range", 0.0),
             "dynatemp_exponent": samplers_dict.get("dynatemp_exponent", 1.0),
             "xtc_probability": samplers_dict.get("xtc_probability", 0.0),
@@ -960,10 +964,10 @@ class LlamaCPPSubprocessNode:
         
         clean_text = ""
         thoughts_text = ""
-        perf_text = ""
-        usage_stats = "No usage data"
         prompt_tokens = 0
         completion_tokens = 0
+        t_prompt = 0.0
+        t_gen = 0.0
 
         try:
             with urllib.request.urlopen(req) as response:
@@ -990,15 +994,10 @@ class LlamaCPPSubprocessNode:
                             usage = chunk["usage"]
                             prompt_tokens = usage.get("prompt_tokens", 0)
                             completion_tokens = usage.get("completion_tokens", 0)
-                            ctx_total = prompt_tokens + completion_tokens
-                            ctx_pct = (ctx_total / ctx_size * 100) if ctx_size > 0 else 0
-                            usage_stats = f"Prompt Tokens: {prompt_tokens}\nCompletion Tokens: {completion_tokens}\nTotal Context: {ctx_total} / {ctx_size} ({ctx_pct:.1f}%)"
 
                         if "timings" in chunk:
                             t_prompt = chunk["timings"].get("prompt_per_second", 0)
                             t_gen = chunk["timings"].get("predicted_per_second", 0)
-                            ctx_info = f"Ctx: {prompt_tokens+completion_tokens}/{ctx_size} " if prompt_tokens else ""
-                            perf_text = f"{ctx_info}| P: {t_prompt:.1f} t/s | G: {t_gen:.1f} t/s"
                             
                     except json.JSONDecodeError: pass
 
@@ -1006,6 +1005,16 @@ class LlamaCPPSubprocessNode:
             clean_text = f"API Ошибка {e.code}: {e.read().decode('utf-8')}"
         except Exception as e:
             clean_text = f"Сетевая ошибка: {e}"
+
+        # Форматируем итоговые строки метрик на основе накопленных за время стрима данных
+        ctx_total = prompt_tokens + completion_tokens
+        if ctx_total > 0:
+            ctx_pct = (ctx_total / ctx_size * 100) if ctx_size > 0 else 0
+            usage_stats = f"Prompt Tokens: {prompt_tokens}\nCompletion Tokens: {completion_tokens}\nTotal Context: {ctx_total} / {ctx_size} ({ctx_pct:.1f}%)"
+            perf_text = f"Ctx: {ctx_total}/{ctx_size} ({ctx_pct:.1f}%) | P: {t_prompt:.1f} t/s | G: {t_gen:.1f} t/s"
+        else:
+            usage_stats = "No usage data"
+            perf_text = f"P: {t_prompt:.1f} t/s | G: {t_gen:.1f} t/s"
 
         if "<think>" in clean_text:
             think_match = re.search(r'<think>(.*?)</think>', clean_text, flags=re.DOTALL | re.IGNORECASE)

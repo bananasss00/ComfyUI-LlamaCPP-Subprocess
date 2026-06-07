@@ -444,6 +444,12 @@ class LlamaCPPChatHistoryNode:
     FUNCTION = "get_history"
     CATEGORY = "LlamaCPP/Chat"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Принудительно заставляем ComfyUI обновлять эту ноду каждый раз,
+        # чтобы она подтягивала актуальные сообщения из памяти, а не из кэша.
+        return float("NaN")
+
     def get_history(self, session_id, reset_session, system_prompt, context_mode="keep_all", keep_first_n=2, keep_recent_n=4, summarize_prompt="", summary_max_tokens=500):
         global CHAT_SESSIONS
         s_id = session_id.strip() or "default"
@@ -1066,6 +1072,10 @@ class LlamaCPPUnloadNode:
                 "server_id": ("STRING", {
                     "default": "all",
                     "tooltip": "Идентификатор сервера для выгрузки. Укажите 'all' чтобы выгрузить все запущенные серверы."
+                }),
+                "clear_all_chats": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Очистить историю абсолютно всех чат-сессий из оперативной памяти."
                 })
             }
         }
@@ -1075,7 +1085,12 @@ class LlamaCPPUnloadNode:
     CATEGORY = "LlamaCPP/Memory"
     OUTPUT_NODE = True
 
-    def unload_models(self, unload_active, server_id="all", any_input=None):
+    def unload_models(self, unload_active, server_id="all", clear_all_chats=False, any_input=None):
+        global CHAT_SESSIONS
+        if clear_all_chats:
+            CHAT_SESSIONS.clear()
+            print("[LlamaCPP] Все сессии чатов успешно очищены из памяти.")
+            
         if unload_active:
             if server_id == "all" or not server_id.strip():
                 print("\n[LlamaCPP] Нода инициировала выгрузку всех серверов...")

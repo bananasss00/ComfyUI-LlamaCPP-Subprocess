@@ -396,7 +396,52 @@ class LlamaCPPAdvancedSamplersNode:
             "banned_tokens": banned_tokens
         },)
 
+class LlamaCPPSpeculativeNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "draft_model": (model_options(), {
+                    "tooltip": "Файл GGUF вспомогательной драфт-модели. Файлы должны находиться в папке ComfyUI/models/LLM."
+                }),
+                "spec_type": (["draft-mtp", "draft-simple", "draft-eagle3", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache", "none"], {
+                    "default": "draft-mtp",
+                    "tooltip": "Тип спекулятивного декодирования. Например, 'draft-mtp' для MTP-моделей (Gemma 4 MTP), 'draft-simple' для стандартных легких моделей-ассистентов."
+                }),
+                "spec_draft_n_max": ("INT", {
+                    "default": 4, "min": 1, "max": 64, "step": 1,
+                    "tooltip": "Максимальное количество токенов, генерируемых вспомогательной моделью за одну итерацию."
+                }),
+                "spec_draft_n_min": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Минимальное количество токенов для драфт-модели."
+                }),
+                "spec_draft_p_min": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Минимальный порог вероятности спекулятивного токена (0.0 — отключено)."
+                }),
+                "gpu_layers_draft": ("INT", {
+                    "default": 99, "min": -1, "max": 999,
+                    "tooltip": "Количество слоев вспомогательной модели, переносимых в VRAM GPU (-ngld). 99 означает полный перенос."
+                })
+            }
+        }
 
+    RETURN_TYPES = ("LLAMA_SPEC_SETTINGS",)
+    RETURN_NAMES = ("spec_settings",)
+    FUNCTION = "get_settings"
+    CATEGORY = "LlamaCPP/Inference"
+
+    def get_settings(self, draft_model, spec_type, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, gpu_layers_draft):
+        return ({
+            "draft_model": draft_model,
+            "spec_type": spec_type,
+            "spec_draft_n_max": spec_draft_n_max,
+            "spec_draft_n_min": spec_draft_n_min,
+            "spec_draft_p_min": spec_draft_p_min,
+            "gpu_layers_draft": gpu_layers_draft
+        },)
+    
 class LlamaCPPChatHistoryNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -634,6 +679,9 @@ class LlamaCPPSubprocessNode:
                 "chat_history": ("LLAMA_CHAT_HISTORY", {
                     "tooltip": "Подключите историю сессии чата, чтобы включить режим памяти и вести диалог с моделью."
                 }),
+                "spec_settings": ("LLAMA_SPEC_SETTINGS", {
+                    "tooltip": "Настройки спекулятивного декодирования. Подключите выход ноды LlamaCPP Speculative Settings."
+                }),
                 "system_prompt_preset": (system_prompt_options(), {
                     "default": NO_SYSTEM_PROMPT,
                     "tooltip": "Шаблон системного промпта. Ваши .txt файлы из папки ComfyUI/models/LLM/prompts появятся в этом списке."
@@ -680,7 +728,7 @@ class LlamaCPPSubprocessNode:
     def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
-                      chat_history=None):
+                      chat_history=None, spec_settings=None):
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -696,13 +744,35 @@ class LlamaCPPSubprocessNode:
         else:
             exe_path = executable_path
 
+        # Speculative decoding settings
+        draft_model_path = ""
+        spec_type = "none"
+        spec_draft_n_max = 4
+        spec_draft_n_min = 0
+        spec_draft_p_min = 0.0
+        gpu_layers_draft = -1
+        
+        if spec_settings:
+            spec_type = spec_settings.get("spec_type", "none")
+            spec_draft_n_max = spec_settings.get("spec_draft_n_max", 4)
+            spec_draft_n_min = spec_settings.get("spec_draft_n_min", 0)
+            spec_draft_p_min = spec_settings.get("spec_draft_p_min", 0.0)
+            gpu_layers_draft = spec_settings.get("gpu_layers_draft", -1)
+            
+            draft_model_name = spec_settings.get("draft_model", "")
+            if draft_model_name and draft_model_name != NO_MODELS_FOUND:
+                draft_model_path = str(full_model_path(draft_model_name))
+
         # Create config hash to detect if we need to restart server
         current_config = {
             "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, "ctx_q": context_quantization,
             "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
             "args": extra_cli_args, "reasoning": reasoning, "flash_attn": flash_attention,
             "batch": batch_size, "np": parallel_requests, "no_mmap": no_mmap, "no_warmup": no_warmup, 
-            "mlock": mlock, "fitt": fit_target_mib, "ot": override_tensor
+            "mlock": mlock, "fitt": fit_target_mib, "ot": override_tensor,
+            "spec_type": spec_type, "draft_model": draft_model_path, 
+            "spec_draft_n_max": spec_draft_n_max, "spec_draft_n_min": spec_draft_n_min,
+            "spec_draft_p_min": spec_draft_p_min, "gpu_layers_draft": gpu_layers_draft
         }
 
         # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
@@ -744,6 +814,23 @@ class LlamaCPPSubprocessNode:
                 cmd.extend(["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"])
             
             if mm_path: cmd.extend(["--mmproj", mm_path])
+            if spec_type and spec_type != "none":
+                cmd.extend(["--spec-type", spec_type])
+                
+            if draft_model_path:
+                cmd.extend(["--model-draft", draft_model_path])
+                
+            if spec_draft_n_max > 0:
+                cmd.extend(["--spec-draft-n-max", str(spec_draft_n_max)])
+                
+            if spec_draft_n_min > 0:
+                cmd.extend(["--spec-draft-n-min", str(spec_draft_n_min)])
+                
+            if spec_draft_p_min > 0.0:
+                cmd.extend(["--spec-draft-p-min", f"{spec_draft_p_min:.3f}"])
+                
+            if gpu_layers_draft >= 0:
+                cmd.extend(["-ngld", str(gpu_layers_draft)])
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
             if extra_cli_args: cmd.extend(extra_cli_args.split())
 
@@ -1112,7 +1199,8 @@ NODE_CLASS_MAPPINGS = {
     "LlamaCPP_Subprocess": LlamaCPPSubprocessNode,
     "LlamaCPP_UnloadAll": LlamaCPPUnloadNode,
     "LlamaCPP_ChatHistory": LlamaCPPChatHistoryNode,
-    "LlamaCPP_FormatHistory": LlamaCPPFormatHistoryNode
+    "LlamaCPP_FormatHistory": LlamaCPPFormatHistoryNode,
+    "LlamaCPP_SpeculativeSettings": LlamaCPPSpeculativeNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1120,5 +1208,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaCPP_Subprocess": "LlamaCPP Server Model",
     "LlamaCPP_UnloadAll": "LlamaCPP Unload All",
     "LlamaCPP_ChatHistory": "LlamaCPP Chat History",
-    "LlamaCPP_FormatHistory": "LlamaCPP Format History"
+    "LlamaCPP_FormatHistory": "LlamaCPP Format History",
+    "LlamaCPP_SpeculativeSettings": "LlamaCPP Speculative Settings"
 }

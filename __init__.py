@@ -771,6 +771,9 @@ class LlamaCPPSubprocessNode:
             
             server_ready = False
             for _ in range(60):
+                # Если процесс завершился (например, упал по OOM), прерываем ожидание немедленно
+                if process.poll() is not None:
+                    break
                 try:
                     req = urllib.request.Request(f"http://127.0.0.1:{port}/health", method="GET")
                     with urllib.request.urlopen(req, timeout=1) as response:

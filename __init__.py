@@ -16,6 +16,7 @@ import zipfile
 import threading
 import inspect
 import atexit
+import shlex
 import execution
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,7 +98,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b9585"
+LLAMA_CPP_RELEASE_TAG = "b9626"
 RELEASE_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_RELEASE_TAG}"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
@@ -644,7 +645,7 @@ class LlamaCPPSubprocessNode:
                     "tooltip": "Если включено, сервер останется висеть в памяти после ответа (для быстрых повторных запросов). Если выключено - модель полностью выгрузится, освободив VRAM."
                 }),
                 "batch_size": ("INT", {
-                    "default": 512, "min": 1, "max": 8192, "step": 64,
+                    "default": 512, "min": 64, "max": 8192, "step": 64,
                     "tooltip": "Скорость чтения промпта (--batch-size). Сколько токенов обрабатывается за раз при анализе входа. 512 - баланс. Уменьшите, если не хватает VRAM."
                 }),
                 "parallel_requests": ("INT", {
@@ -717,6 +718,14 @@ class LlamaCPPSubprocessNode:
                     "default": "default",
                     "tooltip": "Уникальный идентификатор сервера. Позволяет одновременно запускать несколько разных моделей Llama."
                 }),
+                "reasoning_budget": ("INT", {
+                    "default": 0, "min": 0, "max": 32768, "step": 128,
+                    "tooltip": "Динамический лимит токенов размышлений (0 = выключено/без лимита). Передается в API без рестарта сервера."
+                }),
+                "reasoning_budget_message": ("STRING", {
+                    "default": "Conclusion:",
+                    "tooltip": "Текст, который плавно завершит мысли при превышении лимита (например: '... thinking budget exceeded, let's answer now.')."
+                }),
             }
         }
 
@@ -728,7 +737,7 @@ class LlamaCPPSubprocessNode:
     def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
                       system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
-                      chat_history=None, spec_settings=None):
+                      chat_history=None, spec_settings=None, reasoning_budget=0, reasoning_budget_message="Conclusion:"):
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -832,7 +841,7 @@ class LlamaCPPSubprocessNode:
             if gpu_layers_draft >= 0:
                 cmd.extend(["-ngld", str(gpu_layers_draft)])
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
-            if extra_cli_args: cmd.extend(extra_cli_args.split())
+            if extra_cli_args: cmd.extend(shlex.split(extra_cli_args))
 
             print(f"\n[LlamaCPP] Запуск сервера '{server_id}': {' '.join(cmd)}")
             log_file_path = os.path.join(os.getcwd(), f"llama_server_{server_id}_debug.log")
@@ -1030,6 +1039,14 @@ class LlamaCPPSubprocessNode:
             "tfs_z": samplers_dict.get("tfs_z", 1.0),
             "typical_p": samplers_dict.get("typical_p", 1.0),
         }
+
+        if reasoning_budget > 0:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": True,
+                "reasoning_budget": reasoning_budget
+            }
+            if reasoning_budget_message.strip():
+                payload["chat_template_kwargs"]["reasoning_budget_message"] = reasoning_budget_message.strip()
 
         # ОБРАБОТКА ЗАПРЕЩЕННЫХ СЛОВ (LOGIT BIAS)
         if banned_tokens_str and banned_tokens_str.strip():

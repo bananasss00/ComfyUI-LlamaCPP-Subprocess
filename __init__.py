@@ -98,7 +98,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b9626"
+LLAMA_CPP_RELEASE_TAG = "b9859"
 RELEASE_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_RELEASE_TAG}"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
@@ -616,9 +616,9 @@ class LlamaCPPSubprocessNode:
                     "default": True,
                     "tooltip": "КРАЙНЕ РЕКОМЕНДУЕТСЯ. Flash Attention (-fa) кардинально снижает потребление видеопамяти при больших контекстах и ускоряет генерацию."
                 }),
-                "context_quantization": (["none", "q8", "q4"], {
-                    "default": "none",
-                    "tooltip": "Квантование контекста (сжатие памяти диалога). 'q8' экономит ~50% VRAM контекста, 'q4' экономит ~75%. Минимально влияет на качество."
+                "context_quantization": (["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], {
+                    "default": "f16",
+                    "tooltip": "Квантование контекста (сжатие KV-cache). 'f16' — стандартное качество, 'q8_0' экономит ~50% VRAM контекста, 'q4_0' экономит ~75%."
                 }),
                 "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
                     "default": "auto",
@@ -817,10 +817,8 @@ class LlamaCPPSubprocessNode:
             if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["--n-cpu-moe", str(n_cpu_moe_layers)])
             
-            if context_quantization == "q8":
-                cmd.extend(["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"])
-            elif context_quantization == "q4":
-                cmd.extend(["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"])
+            if context_quantization:
+                cmd.extend(["--cache-type-k", context_quantization, "--cache-type-v", context_quantization])
             
             if mm_path: cmd.extend(["--mmproj", mm_path])
             if spec_type and spec_type != "none":

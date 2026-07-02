@@ -623,9 +623,9 @@ class LlamaCPPSubprocessNode:
                     "default": True,
                     "tooltip": "КРАЙНЕ РЕКОМЕНДУЕТСЯ. Flash Attention (-fa) кардинально снижает потребление видеопамяти при больших контекстах и ускоряет генерацию."
                 }),
-                "context_quantization": (["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], {
-                    "default": "f16",
-                    "tooltip": "Квантование контекста (сжатие KV-cache). 'f16' — стандартное качество, 'q8_0' экономит ~50% VRAM контекста, 'q4_0' экономит ~75%."
+                "context_quantization": (["none", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], {
+                    "default": "none",
+                    "tooltip": "Квантование контекста (сжатие KV-cache). 'none' — по умолчанию (без принудительного сжатия), 'q8_0' экономит ~50% VRAM контекста, 'q4_0' экономит ~75%."
                 }),
                 "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
                     "default": "auto",
@@ -824,7 +824,7 @@ class LlamaCPPSubprocessNode:
             if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["--n-cpu-moe", str(n_cpu_moe_layers)])
             
-            if context_quantization:
+            if context_quantization and context_quantization != "none":
                 cmd.extend(["--cache-type-k", context_quantization, "--cache-type-v", context_quantization])
             
             if mm_path: cmd.extend(["--mmproj", mm_path])

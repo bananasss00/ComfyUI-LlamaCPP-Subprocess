@@ -34,6 +34,13 @@ PROMPT_FOLDER = "llm_text_processor_prompts"
 NO_SYSTEM_PROMPT = "none"
 NO_MMPROJ = "none"
 NO_MODELS_FOUND = "No GGUF models found"
+NO_DRAFT_MODEL = "none (built-in MTP / N-gram)"
+
+def draft_model_options() -> list[str]:
+    models = model_options()
+    if NO_MODELS_FOUND in models:
+        return [NO_DRAFT_MODEL]
+    return [NO_DRAFT_MODEL] + models
 
 # Словарь с базовыми пресетами промптов
 DEFAULT_PROMPTS = {
@@ -402,8 +409,8 @@ class LlamaCPPSpeculativeNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "draft_model": (model_options(), {
-                    "tooltip": "Файл GGUF вспомогательной драфт-модели. Файлы должны находиться в папке ComfyUI/models/LLM."
+                "draft_model": (draft_model_options(), {
+                    "tooltip": "Файл GGUF вспомогательной драфт-модели. Выберите 'none (built-in MTP / N-gram)', если используете встроенный MTP или n-gram спекуляцию."
                 }),
                 "spec_type": (["draft-mtp", "draft-simple", "draft-eagle3", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache", "none"], {
                     "default": "draft-mtp",
@@ -769,7 +776,7 @@ class LlamaCPPSubprocessNode:
             gpu_layers_draft = spec_settings.get("gpu_layers_draft", -1)
             
             draft_model_name = spec_settings.get("draft_model", "")
-            if draft_model_name and draft_model_name != NO_MODELS_FOUND:
+            if draft_model_name and draft_model_name not in {NO_MODELS_FOUND, NO_DRAFT_MODEL}:
                 draft_model_path = str(full_model_path(draft_model_name))
 
         # Create config hash to detect if we need to restart server

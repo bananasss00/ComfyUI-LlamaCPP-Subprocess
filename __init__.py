@@ -18,12 +18,36 @@ import inspect
 import atexit
 import shlex
 import execution
+import unicodedata
+
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import folder_paths
 import comfy.model_management
+
+def sanitize_prompt(text: str) -> str:
+    if not text:
+        return ""
+    
+    # 1. Юникод-нормализация NFKC
+    # Конвертирует полноширинные буквы (ｋｅｙ -> key), математические начертания и лигатуры в стандартный ASCII
+    normalized = unicodedata.normalize('NFKC', text)
+    
+    # 2. Удаление невидимых символов и управляющих кодов юникода
+    # \u200b-\u200d: невидимые пробелы нулевой ширины и соединители
+    # \ufeff: маркер порядка байтов (BOM)
+    # \u200e\u200f: маркеры направления текста LTR/RTL
+    clean = re.sub(r'[\u200b-\u200d\ufeff\u200e\u200f]', '', normalized)
+    
+    # 3. Удаление ASCII-управляющих символов (кроме табуляции и переноса строки)
+    clean = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', clean)
+    
+    # 4. Схлопывание множественных пробелов в один (если они образовались)
+    clean = re.sub(r'[ \t]+', ' ', clean)
+    
+    return clean.strip()
 
 # =======================================================================
 # 1. СИСТЕМА ПУТЕЙ И РЕЕСТР ФАЙЛОВ (DROPDOWNS)
@@ -748,6 +772,10 @@ class LlamaCPPSubprocessNode:
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
+        prompt = sanitize_prompt(prompt)
+        if system_prompt_text:
+            system_prompt_text = sanitize_prompt(system_prompt_text)
+            
         if model == NO_MODELS_FOUND:
             raise ValueError("No models found. Please put .gguf files in ComfyUI/models/LLM")
 

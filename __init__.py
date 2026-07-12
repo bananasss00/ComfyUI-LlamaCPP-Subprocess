@@ -7,6 +7,7 @@ import json
 import base64
 import socket
 import re
+import wave
 import numpy as np
 from PIL import Image
 import io
@@ -232,6 +233,40 @@ def tensors_to_base64_list(image_tensor, max_frames=8):
         img.save(buffered, format="JPEG", quality=85)
         b64_list.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
     return b64_list
+
+def audio_to_base64_wav(audio_input) -> str:
+    if not isinstance(audio_input, dict) or "waveform" not in audio_input:
+        raise ValueError("Неверный формат AUDIO в ComfyUI.")
+        
+    waveform = audio_input["waveform"]
+    sample_rate = audio_input.get("sample_rate", 16000)
+    
+    # ComfyUI AUDIO тензор имеет форму [batch, channels, samples]
+    if waveform.dim() == 3:
+        waveform = waveform[0] # Берем первый батч
+        
+    audio_np = waveform.cpu().numpy()
+    
+    # Приводим к размерности [samples, channels]
+    if audio_np.ndim == 2:
+        audio_np = audio_np.T
+    elif audio_np.ndim == 1:
+        audio_np = audio_np[:, np.newaxis]
+        
+    # Нормализуем float (-1.0 ... 1.0) в 16-битный PCM (signed int16)
+    audio_int16 = np.clip(audio_np * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    num_channels = audio_int16.shape[1]
+    
+    # Записываем WAV в оперативную память
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(num_channels)
+        wav_file.setsampwidth(2) # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_int16.tobytes())
+        
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
 
 def update_global_vram_reservation():
     global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
@@ -729,10 +764,6 @@ class LlamaCPPSubprocessNode:
                     "default": 8, "min": 1, "max": 128, "step": 1,
                     "tooltip": "Максимальное количество кадров, которое будет равномерно извлечено из батча картинок (видео) и отправлено модели."
                 }),
-                "audio_video_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "Абсолютный путь к медиафайлу на вашем компьютере (опционально, вместо передачи через вход image)."
-                }),
                 "executable_path": ("STRING", {
                     "default": "auto", 
                     "tooltip": "Путь до исполняемого файла llama-server.exe. Значение 'auto' автоматически скачает и настроит нужную версию."
@@ -757,6 +788,9 @@ class LlamaCPPSubprocessNode:
                     "default": "Conclusion:",
                     "tooltip": "Текст, который плавно завершит мысли при превышении лимита (например: '... thinking budget exceeded, let's answer now.')."
                 }),
+                "audio": ("AUDIO", {
+                    "tooltip": "Стандартный аудио-вход ComfyUI (например, из Load Audio) для передачи голоса/звуков."
+                }),
             }
         }
 
@@ -767,8 +801,8 @@ class LlamaCPPSubprocessNode:
 
     def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, audio_video_path="", executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
-                      chat_history=None, spec_settings=None, reasoning_budget=0, reasoning_budget_message="Conclusion:"):
+                      system_prompt_text="", image=None, max_video_frames=8, executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
+                      chat_history=None, spec_settings=None, reasoning_budget=0, reasoning_budget_message="Conclusion:", audio=None):
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -1024,9 +1058,6 @@ class LlamaCPPSubprocessNode:
         # Чтобы модель не "сбрасывала" контекст и не описывала картинку заново с нуля,
         # мы прикрепляем картинки и видео ТОЛЬКО к самому первому сообщению в сессии.
         if not is_followup:
-            if audio_video_path and os.path.exists(audio_video_path):
-                user_content.append({"type": "text", "text": f"Media file attached: {audio_video_path}\n"})
-            
             if image is not None:
                 if not mm_path:
                     print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
@@ -1036,6 +1067,23 @@ class LlamaCPPSubprocessNode:
                         user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
                     for b64_img in b64_images:
                         user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
+
+            if audio is not None:
+                if not mm_path:
+                    print("[LlamaCPP Warning] Передано аудио, но mmproj не выбран! Аудио будет проигнорировано.")
+                else:
+                    try:
+                        audio_b64 = audio_to_base64_wav(audio)
+                        user_content.append({
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_b64,
+                                "format": "wav"
+                            }
+                        })
+                        print("[LlamaCPP] Аудио успешно обработано и добавлено в Payload.")
+                    except Exception as e:
+                        print(f"[LlamaCPP Warning] Не удалось обработать аудио: {e}")
 
         user_content.append({"type": "text", "text": prompt})
 

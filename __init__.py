@@ -908,7 +908,11 @@ class LlamaCPPSubprocessNode:
             if gpu_layers_draft >= 0:
                 cmd.extend(["-ngld", str(gpu_layers_draft)])
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
-            if extra_cli_args: cmd.extend(shlex.split(extra_cli_args))
+            if extra_cli_args and extra_cli_args.strip():
+                # Заменяем обратные слэши на прямые до shlex.split, чтобы Python не съедал их на Windows
+                clean_extra_args = extra_cli_args.replace('\\', '/')
+                parsed_extra_args = [arg.strip('"\'') for arg in shlex.split(clean_extra_args)]
+                cmd.extend(parsed_extra_args)
 
             print(f"\n[LlamaCPP] Запуск сервера '{server_id}': {' '.join(cmd)}")
             log_file_path = os.path.join(os.getcwd(), f"llama_server_{server_id}_debug.log")
@@ -1058,22 +1062,13 @@ class LlamaCPPSubprocessNode:
         # Чтобы модель не "сбрасывала" контекст и не описывала картинку заново с нуля,
         # мы прикрепляем картинки и видео ТОЛЬКО к самому первому сообщению в сессии.
         if not is_followup:
-            if image is not None:
-                if not mm_path:
-                    print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
-                else:
-                    b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
-                    if len(b64_images) > 1:
-                        user_content.append({"type": "text", "text": "(Video sequence frames attached)\n"})
-                    for b64_img in b64_images:
-                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
-
             if audio is not None:
                 if not mm_path:
                     print("[LlamaCPP Warning] Передано аудио, но mmproj не выбран! Аудио будет проигнорировано.")
                 else:
                     try:
                         audio_b64 = audio_to_base64_wav(audio)
+                        user_content.append({"type": "text", "text": "[ATTACHED AUDIO STREAM BELOW]:\n"})
                         user_content.append({
                             "type": "input_audio",
                             "input_audio": {
@@ -1084,6 +1079,16 @@ class LlamaCPPSubprocessNode:
                         print("[LlamaCPP] Аудио успешно обработано и добавлено в Payload.")
                     except Exception as e:
                         print(f"[LlamaCPP Warning] Не удалось обработать аудио: {e}")
+                        
+            if image is not None:
+                if not mm_path:
+                    print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
+                else:
+                    b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
+                    if len(b64_images) > 1:
+                        user_content.append({"type": "text", "text": "\n[ATTACHED VIDEO FRAMES BELOW]:\n"})
+                    for b64_img in b64_images:
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
 
         user_content.append({"type": "text", "text": prompt})
 

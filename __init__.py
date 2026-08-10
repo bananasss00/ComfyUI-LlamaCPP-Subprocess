@@ -758,11 +758,14 @@ class LlamaCPPSubprocessNode:
                     "tooltip": "Дополнительный ручной текст системного промпта. Будет приклеен к выбранному выше шаблону."
                 }),
                 "image": ("IMAGE", {
-                    "tooltip": "Подключите сюда картинку или батч картинок (видео). Обязательно выберите mmproj-файл выше!"
+                    "tooltip": "Картинка или батч независимых картинок."
+                }),
+                "video": ("IMAGE", {
+                    "tooltip": "Видео (батч последовательных кадров)."
                 }),
                 "max_video_frames": ("INT", {
                     "default": 8, "min": 1, "max": 128, "step": 1,
-                    "tooltip": "Максимальное количество кадров, которое будет равномерно извлечено из батча картинок (видео) и отправлено модели."
+                    "tooltip": "Сколько кадров равномерно выбрать из видео."
                 }),
                 "executable_path": ("STRING", {
                     "default": "auto", 
@@ -801,7 +804,7 @@ class LlamaCPPSubprocessNode:
 
     def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
                       n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, max_video_frames=8, executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
+                      system_prompt_text="", image=None, video=None, max_video_frames=8, executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
                       chat_history=None, spec_settings=None, reasoning_budget=0, reasoning_budget_message="Conclusion:", audio=None):
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
@@ -1082,13 +1085,24 @@ class LlamaCPPSubprocessNode:
                         
             if image is not None:
                 if not mm_path:
-                    print("[LlamaCPP Warning] Передано изображение/видео, но mmproj не выбран! Изображение будет проигнорировано.")
+                    print("[LlamaCPP Warning] Переданы изображения, но mmproj не выбран! Изображения будут проигнорированы.")
                 else:
-                    b64_images = tensors_to_base64_list(image, max_frames=max_video_frames)
-                    if len(b64_images) > 1:
-                        user_content.append({"type": "text", "text": "\n[ATTACHED VIDEO FRAMES BELOW]:\n"})
+                    b64_images = tensors_to_base64_list(image)
+                    if len(b64_images) == 1:
+                        user_content.append({"type": "text", "text": "\n[ATTACHED IMAGE BELOW — a single standalone picture]:\n"})
+                    else:
+                        user_content.append({"type": "text", "text": f"\n[ATTACHED IMAGES BELOW — {len(b64_images)} separate standalone pictures, NOT a video]:\n"})
                     for b64_img in b64_images:
                         user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
+
+            if video is not None:
+                if not mm_path:
+                    print("[LlamaCPP Warning] Передано видео, но mmproj не выбран! Видео будет проигнорировано.")
+                else:
+                    b64_video_frames = tensors_to_base64_list(video, max_frames=max_video_frames)
+                    user_content.append({"type": "text", "text": f"\n[ATTACHED VIDEO FRAMES BELOW — {len(b64_video_frames)} sequential frames from ONE video, in chronological order]:\n"})
+                    for b64_frame in b64_video_frames:
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_frame}"}})
 
         user_content.append({"type": "text", "text": prompt})
 

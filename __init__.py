@@ -26,6 +26,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import folder_paths
+from comfy_api.latest import ComfyExtension
+from comfy_api.latest import io as comfy_io  # алиас, чтобы не затенять стандартный модуль `io`
 import comfy.model_management
 
 def sanitize_prompt(text: str) -> str:
@@ -130,10 +132,12 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b9859"
-RELEASE_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_RELEASE_TAG}"
+LLAMA_CPP_RELEASE_TAG = "b10354"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
+# Локальный кеш списка ассетов релиза. Release-assets на GitHub неизменны,
+# поэтому кеш валиден навсегда — после первой загрузки мы вообще не обращаемся к github.com.
+RELEASE_CACHE_FILE = VENDOR_ROOT / f"_release_cache_{LLAMA_CPP_RELEASE_TAG}.json"
 
 @dataclass(frozen=True)
 class PlatformSpec:
@@ -159,6 +163,85 @@ def _download_file(url: str, destination: Path) -> None:
             while chunk := resp.read(1024 * 256):
                 f.write(chunk)
 
+
+def _fetch_release_assets_via_html(tag: str) -> list:
+    """
+    Возвращает список ассетов релиза [{"name": ..., "browser_download_url": ...}, ...]
+    БЕЗ использования GitHub API — парсит обычную HTML-страницу expanded_assets.
+    
+    Почему так: GitHub API имеет лимит 60 запросов/час для анонимов и легко бьётся
+    при частых перезапусках ComfyUI. HTML-страница /releases/expanded_assets/{tag}
+    — это обычная веб-страница, она НЕ попадает под API rate-limit. Токен не нужен.
+    
+    Ассеты на GitHub неизменны, поэтому результат кешируется локально —
+    при следующем запуске мы вообще не обращаемся к github.com.
+    """
+    # 1. Читаем локальный кеш (валиден навсегда — release-assets на GitHub неизменны)
+    if RELEASE_CACHE_FILE.exists():
+        try:
+            with RELEASE_CACHE_FILE.open("r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if isinstance(cached, list) and cached:
+                return cached
+        except Exception:
+            pass  # кеш битый — идём в сеть
+    
+    # 2. Парсим HTML-страницу github.com/.../releases/expanded_assets/{tag}
+    #    Эта страница НЕ попадает под API rate-limit (она для браузеров, не для API).
+    url = f"https://github.com/ggml-org/llama.cpp/releases/expanded_assets/{tag}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ComfyUI-LLM",
+        "Accept": "text/html,application/xhtml+xml",
+    })
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                f"\n[LlamaCPP] Release tag '{tag}' не найден на github.com/ggml-org/llama.cpp.\n"
+                f"Проверьте LLAMA_CPP_RELEASE_TAG в __init__.py или скачайте llama-server.exe вручную:\n"
+                f"  https://github.com/ggml-org/llama.cpp/releases\n"
+                f"  Распаковать в: {VENDOR_ROOT / tag / WINDOWS_CUDA_13.key}\n"
+            ) from e
+        raise
+    
+    # 3. Извлекаем URL ассетов из HTML
+    #    Pattern: href="/ggml-org/llama.cpp/releases/download/{tag}/{asset_name}"
+    assets = []
+    pattern = re.compile(
+        rf'href="(/ggml-org/llama\.cpp/releases/download/{re.escape(tag)}/([^"]+))"',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(html):
+        relative_url = match.group(1)
+        asset_name = match.group(2)
+        full_url = "https://github.com" + relative_url
+        assets.append({
+            "name": asset_name,
+            "browser_download_url": full_url,
+        })
+    
+    if not assets:
+        raise RuntimeError(
+            f"\n[LlamaCPP] Не удалось найти ассеты на странице {url}.\n"
+            f"Возможно, релиз {tag} ещё не выложен или изменился формат страницы.\n"
+            f"Скачайте llama-server.exe вручную: https://github.com/ggml-org/llama.cpp/releases/tag/{tag}\n"
+            f"Распаковать в: {VENDOR_ROOT / tag / WINDOWS_CUDA_13.key}\n"
+        )
+    
+    # 4. Сохраняем в кеш для следующих запусков
+    try:
+        VENDOR_ROOT.mkdir(parents=True, exist_ok=True)
+        with RELEASE_CACHE_FILE.open("w", encoding="utf-8") as f:
+            json.dump(assets, f, ensure_ascii=False)
+    except Exception:
+        pass  # кеш не записался — не критично
+    
+    return assets
+
+
 def ensure_llama_server_paths() -> str:
     system = platform.system().lower()
     if system != "windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
@@ -171,17 +254,16 @@ def ensure_llama_server_paths() -> str:
     if exe_path.exists():
         return str(exe_path)
 
-    print("[LlamaCPP] Auto-downloading llama-server.exe... Please wait.")
+    print(f"[LlamaCPP] Auto-downloading llama-server.exe (release {LLAMA_CPP_RELEASE_TAG})... Please wait.")
     install_dir.mkdir(parents=True, exist_ok=True)
     
-    req = urllib.request.Request(RELEASE_API_URL, headers={"User-Agent": "ComfyUI-LLM"})
-    with urllib.request.urlopen(req) as response:
-        release = json.loads(response.read().decode("utf-8"))
+    # Получаем список ассетов через HTML-страницу (без API rate-limit)
+    assets = _fetch_release_assets_via_html(LLAMA_CPP_RELEASE_TAG)
     
     with TemporaryDirectory() as temp:
         temp_dir = Path(temp)
         for pattern in spec.asset_patterns:
-            matches =[a for a in release.get("assets", []) if fnmatch.fnmatch(a.get("name", "").lower(), pattern.lower())]
+            matches = [a for a in assets if fnmatch.fnmatch(a.get("name", "").lower(), pattern.lower())]
             if matches:
                 asset = sorted(matches, key=lambda i: i.get("name", ""))[0]
                 archive_path = temp_dir / asset["name"]
@@ -191,7 +273,47 @@ def ensure_llama_server_paths() -> str:
                     
     if not exe_path.exists():
         raise RuntimeError(f"Failed to find {spec.cli_executable} after download.")
+
+    # === АВТО-ЧИСТКА СТАРЫХ ВЕРСИЙ ===
+    # После успешной загрузки текущей (hardcoded) версии удаляем все остальные
+    # подкаталоги в VENDOR_ROOT и старые кеш-файлы _release_cache_*.json,
+    # кроме тех, что соответствуют LLAMA_CPP_RELEASE_TAG.
+    # Это предотвращает накопление старых релизов на диске.
+    try:
+        if VENDOR_ROOT.exists():
+            import shutil
+            removed = []
+            current_cache_name = RELEASE_CACHE_FILE.name
+            for sub in VENDOR_ROOT.iterdir():
+                # Подкаталоги релизов (например b9859/, b10354/)
+                if sub.is_dir() and sub.name != LLAMA_CPP_RELEASE_TAG:
+                    shutil.rmtree(sub, ignore_errors=True)
+                    removed.append(sub.name)
+                # Старые кеш-файлы _release_cache_*.json (кроме текущего)
+                elif sub.is_file() and sub.name.startswith("_release_cache_") and sub.name.endswith(".json") and sub.name != current_cache_name:
+                    try:
+                        sub.unlink()
+                        removed.append(sub.name)
+                    except Exception:
+                        pass
+            if removed:
+                print(f"[LlamaCPP] Removed {len(removed)} old llama.cpp artifact(s): {', '.join(removed)}")
+    except Exception as cleanup_err:
+        print(f"[LlamaCPP Warning] Failed to clean old llama.cpp versions: {cleanup_err}")
+
     return str(exe_path)
+
+
+def resolve_executable_path(executable_path: str) -> str:
+    """
+    Разрешает путь к llama-server.exe.
+    Если executable_path указывает на существующий файл — используем его.
+    Иначе (включая 'auto', пустую строку, опечатку, удалённый файл) — встроенная llama.
+    """
+    raw = (executable_path or "").strip()
+    if raw and os.path.isfile(raw):
+        return raw
+    return ensure_llama_server_paths()
 
 # =======================================================================
 # 3. ОСНОВНАЯ ЛОГИКА И СЕРВЕРЫ
@@ -641,171 +763,150 @@ class LlamaCPPFormatHistoryNode:
         return ("\n\n".join(formatted_lines),)
 
 
-class LlamaCPPSubprocessNode:
+class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
+    """
+    Llama.cpp subprocess node — migrated to comfy_api.latest.
+    Dynamic media inputs (Autogrow): images / videos / audios.
+    """
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": (model_options(), {
-                    "tooltip": "Файл GGUF модели для текста. Поместите файлы в папку ComfyUI/models/LLM. Файлы mmproj (для зрения) здесь скрыты."
-                }),
-                "mmproj": (mmproj_options(), {
-                    "default": NO_MMPROJ, 
-                    "tooltip": "Файл проектора зрения (Vision GGUF). Нужен ТОЛЬКО если вы передаете картинки/видео. Обязательно должен подходить к архитектуре основной текстовой модели."
-                }),
-                "prompt": ("STRING", {
-                    "multiline": True, 
-                    "default": "Опиши это видео или изображения подробно.",
-                    "tooltip": "Текст вашего запроса (промпт), который вы отправляете модели."
-                }),
-                "max_tokens": ("INT", {
-                    "default": 2048, "min": 1, "max": 32768,
-                    "tooltip": "Максимальное количество слов (токенов), которое разрешено сгенерировать модели в ответе."
-                }),
-                "temperature": ("FLOAT", {
-                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Температура генерации. Низкая (0.1) делает текст строгим и предсказуемым. Высокая (1.0+) делает текст более творческим и случайным."
-                }),
-                "top_p": ("FLOAT", {
-                    "default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05,
-                    "tooltip": "Top-P (Nucleus). Ограничивает выборку слов, оставляя только те, которые в сумме дают указанную вероятность (0.95 = 95% наиболее вероятных слов)."
-                }),
-                "top_k": ("INT", {
-                    "default": 40, "min": 1, "max": 100,
-                    "tooltip": "Top-K. Жесткое ограничение: выбирать следующее слово только из K самых вероятных вариантов (например, из 40 лучших)."
-                }),
-                "ctx_size": ("INT", {
-                    "default": 16384, "min": 512, "max": 128000, "step": 256,
-                    "tooltip": "Размер контекста в токенах. Сколько истории или текста модель 'помнит'. Большие значения (32к+) сильно потребляют видеопамять (VRAM)."
-                }),
-                "flash_attention": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "КРАЙНЕ РЕКОМЕНДУЕТСЯ. Flash Attention (-fa) кардинально снижает потребление видеопамяти при больших контекстах и ускоряет генерацию."
-                }),
-                "context_quantization": (["none", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], {
-                    "default": "none",
-                    "tooltip": "Квантование контекста (сжатие KV-cache). 'none' — по умолчанию (без принудительного сжатия), 'q8_0' экономит ~50% VRAM контекста, 'q4_0' экономит ~75%."
-                }),
-                "memory_mode": (["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"], {
-                    "default": "auto",
-                    "tooltip": "Режим распределения слоев модели (Авто, только видеокарта, частично процессор). Выбирайте 'auto', если не уверены."
-                }),
-                "gpu_layers": ("INT", {
-                    "default": 99, "min": -1, "max": 999, 
-                    "tooltip": "Сколько слоев модели загрузить в видеокарту (GPU). 999 означает 'все возможные'. Если не хватает VRAM, постепенно уменьшайте это значение."
-                }),
-                "n_cpu_moe_layers": ("INT", {
-                    "default": 1, "min": 1, "max": 999, 
-                    "tooltip": "Количество MoE-слоев, которые останутся на процессоре (только для моделей со смешанной архитектурой)."
-                }),
-                "seed": ("INT", {
-                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
-                    "tooltip": "Зерно случайности. Постоянное значение (например 42) даст одинаковый текст при тех же настройках. 0 = случайный текст каждый раз."
-                }),
-                "reasoning": (["auto", "on", "off"], {
-                    "default": "auto",
-                    "tooltip": "Режим размышления (Reasoning). Нужен для умных моделей вроде DeepSeek-R1, чтобы они выводили процесс решения задачи."
-                }),
-                "keep_model_loaded": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Если включено, сервер останется висеть в памяти после ответа (для быстрых повторных запросов). Если выключено - модель полностью выгрузится, освободив VRAM."
-                }),
-                "batch_size": ("INT", {
-                    "default": 512, "min": 64, "max": 8192, "step": 64,
-                    "tooltip": "Скорость чтения промпта (--batch-size). Сколько токенов обрабатывается за раз при анализе входа. 512 - баланс. Уменьшите, если не хватает VRAM."
-                }),
-                "parallel_requests": ("INT", {
-                    "default": 1, "min": 1, "max": 8, "step": 1,
-                    "tooltip": "Количество слотов запросов (-np). Ограничение в 1 слот экономит VRAM, не позволяя серверу резервировать память под параллельных пользователей."
-                }),
-                "no_mmap": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Отключить MMap. Загрузит модель в ОЗУ напрямую, игнорируя дисковый кэш ОС. Помогает при некоторых ошибках чтения или на медленных дисках."
-                }),
-                "no_warmup": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Отключить 'разогрев'. Пропускает начальный тестовый прогон матрицы при старте сервера, экономя пару секунд времени запуска."
-                }),
-                "mlock": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Блокировка в ОЗУ (--mlock). Запрещает системе выгружать модель из оперативной памяти в файл подкачки диска. Устраняет фризы, но требует много свободной ОЗУ."
-                }),
-                "fit_target_mib": ("INT", {
-                    "default": 0, "min": 0, "max": 24000, "step": 256,
-                    "tooltip": "Гарантированный запас свободной VRAM (-fitt) в Мегабайтах. Укажите, сколько видеопамяти Llama обязана оставить нетронутой (например, 3096 для 3 ГБ под генерацию картинок)."
-                }),
-            },
-            "optional": {
-                "override_tensor": ("STRING", {
-                    "default": "",
-                    "tooltip": "Хак для видеопамяти (-ot). Например, '.*ffn_down.*=CPU' принудительно перенесет самые тяжелые слои модели на процессор, освободив VRAM."
-                }),
-                "extra_samplers": ("LLAMA_SAMPLERS", {
-                    "tooltip": "Подключите сюда выход ноды LlamaCPP Advanced Samplers для тонкой настройки вероятностей."
-                }),
-                "chat_history": ("LLAMA_CHAT_HISTORY", {
-                    "tooltip": "Подключите историю сессии чата, чтобы включить режим памяти и вести диалог с моделью."
-                }),
-                "spec_settings": ("LLAMA_SPEC_SETTINGS", {
-                    "tooltip": "Настройки спекулятивного декодирования. Подключите выход ноды LlamaCPP Speculative Settings."
-                }),
-                "system_prompt_preset": (system_prompt_options(), {
-                    "default": NO_SYSTEM_PROMPT,
-                    "tooltip": "Шаблон системного промпта. Ваши .txt файлы из папки ComfyUI/models/LLM/prompts появятся в этом списке."
-                }),
-                "system_prompt_text": ("STRING", {
-                    "multiline": True, "default": "", 
-                    "tooltip": "Дополнительный ручной текст системного промпта. Будет приклеен к выбранному выше шаблону."
-                }),
-                "image": ("IMAGE", {
-                    "tooltip": "Картинка или батч независимых картинок."
-                }),
-                "video": ("IMAGE", {
-                    "tooltip": "Видео (батч последовательных кадров)."
-                }),
-                "max_video_frames": ("INT", {
-                    "default": 8, "min": 1, "max": 128, "step": 1,
-                    "tooltip": "Сколько кадров равномерно выбрать из видео."
-                }),
-                "executable_path": ("STRING", {
-                    "default": "auto", 
-                    "tooltip": "Путь до исполняемого файла llama-server.exe. Значение 'auto' автоматически скачает и настроит нужную версию."
-                }),
-                "extra_cli_args": ("STRING", {
-                    "default": "",
-                    "tooltip": "Любые другие аргументы командной строки llama.cpp. Только для продвинутых юзеров."
-                }),
-                "extra_reserve_vram": ("FLOAT", {
-                    "default": 0.6, "min": 0.0, "max": 32.0, "step": 0.1,
-                    "tooltip": "Дополнительный 'виртуальный' резерв памяти (в ГБ), который мы сообщаем ComfyUI. Помогает избежать ошибок Out Of Memory (OOM) во время генерации картинок."
-                }),
-                "server_id": ("STRING", {
-                    "default": "default",
-                    "tooltip": "Уникальный идентификатор сервера. Позволяет одновременно запускать несколько разных моделей Llama."
-                }),
-                "reasoning_budget": ("INT", {
-                    "default": 0, "min": 0, "max": 32768, "step": 128,
-                    "tooltip": "Динамический лимит токенов размышлений (0 = выключено/без лимита). Передается в API без рестарта сервера."
-                }),
-                "reasoning_budget_message": ("STRING", {
-                    "default": "Conclusion:",
-                    "tooltip": "Текст, который плавно завершит мысли при превышении лимита (например: '... thinking budget exceeded, let's answer now.')."
-                }),
-                "audio": ("AUDIO", {
-                    "tooltip": "Стандартный аудио-вход ComfyUI (например, из Load Audio) для передачи голоса/звуков."
-                }),
-            }
-        }
+    def define_schema(cls):
+        # --- Autogrow-шаблоны для медиа-входов ---
+        image_pin = comfy_io.Image.Input(
+            "img",
+            optional=True,
+            tooltip="Одна картинка ИЛИ батч картинок (IMAGE [N,H,W,C]). Можно подключать сколько угодно.",
+        )
+        image_template = comfy_io.Autogrow.TemplatePrefix(image_pin, prefix="img", min=0, max=50)
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "LLAMA_CHAT_HISTORY")
-    RETURN_NAMES = ("text", "thoughts", "perf", "usage_stats", "chat_history")
-    FUNCTION = "generate_text"
-    CATEGORY = "LlamaCPP/Inference"
+        video_pin = comfy_io.Image.Input(
+            "vid",
+            optional=True,
+            tooltip="Видео как батч последовательных кадров (IMAGE [N,H,W,C]). Можно подключать сколько угодно.",
+        )
+        video_template = comfy_io.Autogrow.TemplatePrefix(video_pin, prefix="vid", min=0, max=50)
 
-    def generate_text(self, server_id, model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size, flash_attention, context_quantization, memory_mode, gpu_layers, 
-                      n_cpu_moe_layers, seed, reasoning, keep_model_loaded, batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False, mlock=False, fit_target_mib=0, system_prompt_preset=NO_SYSTEM_PROMPT, 
-                      system_prompt_text="", image=None, video=None, max_video_frames=8, executable_path="auto", extra_cli_args="", override_tensor="", extra_samplers=None, extra_reserve_vram=0.6,
-                      chat_history=None, spec_settings=None, reasoning_budget=0, reasoning_budget_message="Conclusion:", audio=None):
+        audio_pin = comfy_io.Audio.Input(
+            "aud",
+            optional=True,
+            tooltip="ComfyUI AUDIO dict (waveform + sample_rate). Можно подключать сколько угодно.",
+        )
+        audio_template = comfy_io.Autogrow.TemplatePrefix(audio_pin, prefix="aud", min=0, max=50)
+
+        return comfy_io.Schema(
+            node_id="LlamaCPP_Subprocess",
+            display_name="LlamaCPP Server Model",
+            description="Llama.cpp subprocess node with dynamic image / video / audio inputs.",
+            category="LlamaCPP/Inference",
+            inputs=[
+                comfy_io.Combo.Input("model", options=model_options(),
+                               tooltip="Файл GGUF модели для текста. Поместите файлы в ComfyUI/models/LLM."),
+                comfy_io.Combo.Input("mmproj", options=mmproj_options(), default=NO_MMPROJ,
+                               tooltip="Файл проектора зрения (Vision GGUF). Нужен ТОЛЬКО если передаются медиа."),
+                comfy_io.String.Input("prompt", multiline=True, default="Опиши это видео или изображения подробно.",
+                                tooltip="Текст вашего запроса (промпт)."),
+                comfy_io.Int.Input("max_tokens", default=2048, min=1, max=32768, step=1,
+                             tooltip="Максимум токенов в ответе."),
+                comfy_io.Float.Input("temperature", default=0.7, min=0.0, max=2.0, step=0.05,
+                               tooltip="Температура генерации."),
+                comfy_io.Float.Input("top_p", default=0.95, min=0.1, max=1.0, step=0.05,
+                               tooltip="Top-P (Nucleus)."),
+                comfy_io.Int.Input("top_k", default=40, min=1, max=100, step=1,
+                             tooltip="Top-K. Жесткое ограничение выборки."),
+                comfy_io.Int.Input("ctx_size", default=16384, min=512, max=128000, step=256,
+                             tooltip="Размер контекста в токенах."),
+                comfy_io.Boolean.Input("flash_attention", default=True,
+                                 tooltip="Flash Attention (-fa). Крайне рекомендуется."),
+                comfy_io.Combo.Input("context_quantization",
+                               options=["none", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+                               default="none",
+                               tooltip="Квантование контекста (сжатие KV-cache)."),
+                comfy_io.Combo.Input("memory_mode",
+                               options=["auto", "gpu_layers", "cpu_moe_layers", "gpu_and_cpu_moe_layers"],
+                               default="auto",
+                               tooltip="Режим распределения слоев модели."),
+                comfy_io.Int.Input("gpu_layers", default=99, min=-1, max=999, step=1,
+                             tooltip="Сколько слоев в GPU. 999 = все."),
+                comfy_io.Int.Input("n_cpu_moe_layers", default=1, min=1, max=999, step=1,
+                             tooltip="MoE-слои на CPU."),
+                comfy_io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, step=1,
+                             tooltip="Зерно случайности. 0 = случайно."),
+                comfy_io.Combo.Input("reasoning", options=["auto", "on", "off"], default="auto",
+                               tooltip="Режим размышления (Reasoning)."),
+                comfy_io.Boolean.Input("keep_model_loaded", default=True,
+                                 tooltip="Оставлять сервер в памяти после ответа."),
+                comfy_io.Int.Input("batch_size", default=512, min=64, max=8192, step=64,
+                             tooltip="Скорость чтения промпта (--batch-size)."),
+                comfy_io.Int.Input("parallel_requests", default=1, min=1, max=8, step=1,
+                             tooltip="Количество слотов запросов (-np)."),
+                comfy_io.Boolean.Input("no_mmap", default=False, tooltip="Отключить MMap."),
+                comfy_io.Boolean.Input("no_warmup", default=False, tooltip="Отключить разогрев."),
+                comfy_io.Boolean.Input("mlock", default=False, tooltip="Блокировка в ОЗУ (--mlock)."),
+                comfy_io.Int.Input("fit_target_mib", default=0, min=0, max=24000, step=256,
+                             tooltip="Гарантированный запас VRAM (-fitt) в МБ."),
+                # --- optional ---
+                comfy_io.String.Input("override_tensor", default="",
+                                tooltip="Хак для видеопамяти (-ot). Например: '.*ffn_down.*=CPU'."),
+                comfy_io.Custom("LLAMA_SAMPLERS").Input("extra_samplers", optional=True,
+                                                  tooltip="Подключите LlamaCPP Advanced Samplers."),
+                comfy_io.Custom("LLAMA_CHAT_HISTORY").Input("chat_history", optional=True,
+                                                      tooltip="Подключите историю чата."),
+                comfy_io.Custom("LLAMA_SPEC_SETTINGS").Input("spec_settings", optional=True,
+                                                      tooltip="Подключите LlamaCPP Speculative Settings."),
+                comfy_io.Combo.Input("system_prompt_preset", options=system_prompt_options(), default=NO_SYSTEM_PROMPT,
+                               tooltip="Шаблон системного промпта."),
+                comfy_io.String.Input("system_prompt_text", multiline=True, default="",
+                                tooltip="Дополнительный ручной системный промпт."),
+                # --- общий параметр для ВСЕХ видео-пинов ---
+                comfy_io.Int.Input("max_video_frames", default=8, min=1, max=128, step=1,
+                             tooltip="Сколько кадров равномерно выбрать из каждого видео (через np.linspace, общий для всех video-пинов)."),
+                # --- autogrow медиа-входы ---
+                comfy_io.Autogrow.Input("images", template=image_template),
+                comfy_io.Autogrow.Input("videos", template=video_template),
+                comfy_io.Autogrow.Input("audios", template=audio_template),
+                # --- misc ---
+                comfy_io.String.Input("executable_path", default="auto",
+                                tooltip="Путь до llama-server.exe. 'auto' ИЛИ пусто ИЛИ невалидный путь → используется встроенная llama (авто-скачивание). Иначе — указанный вами exe."),
+                comfy_io.String.Input("extra_cli_args", default="",
+                                tooltip="Дополнительные аргументы командной строки llama.cpp."),
+                comfy_io.Float.Input("extra_reserve_vram", default=0.6, min=0.0, max=32.0, step=0.1,
+                               tooltip="Дополнительный 'виртуальный' резерв VRAM в ГБ."),
+                comfy_io.String.Input("server_id", default="default",
+                                tooltip="Уникальный идентификатор сервера."),
+                comfy_io.Int.Input("reasoning_budget", default=0, min=0, max=32768, step=128,
+                             tooltip="Динамический лимит токенов размышлений (0 = без лимита)."),
+                comfy_io.String.Input("reasoning_budget_message", default="Conclusion:",
+                                tooltip="Текст, завершающий мысли при превышении лимита."),
+            ],
+            outputs=[
+                comfy_io.String.Output(display_name="text"),
+                comfy_io.String.Output(display_name="thoughts"),
+                comfy_io.String.Output(display_name="perf"),
+                comfy_io.String.Output(display_name="usage_stats"),
+                comfy_io.Custom("LLAMA_CHAT_HISTORY").Output(display_name="chat_history"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls,
+                # required
+                model, mmproj, prompt, max_tokens, temperature, top_p, top_k, ctx_size,
+                flash_attention, context_quantization, memory_mode, gpu_layers,
+                n_cpu_moe_layers, seed, reasoning, keep_model_loaded,
+                batch_size=512, parallel_requests=1, no_mmap=False, no_warmup=False,
+                mlock=False, fit_target_mib=0,
+                # optional server / sampling / history
+                override_tensor="",
+                extra_samplers=None, chat_history=None, spec_settings=None,
+                system_prompt_preset=NO_SYSTEM_PROMPT, system_prompt_text="",
+                # autogrow media + общий параметр видео
+                max_video_frames=8,
+                images=None, videos=None, audios=None,
+                # misc
+                executable_path="auto", extra_cli_args="",
+                extra_reserve_vram=0.6, server_id="default",
+                reasoning_budget=0,
+                reasoning_budget_message="Conclusion:") -> comfy_io.NodeOutput:
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -820,10 +921,8 @@ class LlamaCPPSubprocessNode:
         m_path = str(full_model_path(model))
         mm_path = str(full_model_path(mmproj)) if mmproj != NO_MMPROJ else ""
         
-        if executable_path.strip().lower() == "auto":
-            exe_path = ensure_llama_server_paths()
-        else:
-            exe_path = executable_path
+        # === Разрешение пути к exe: auto / пусто / невалидный путь → встроенная llama ===
+        exe_path = resolve_executable_path(executable_path)
 
         # Speculative decoding settings
         draft_model_path = ""
@@ -1063,15 +1162,75 @@ class LlamaCPPSubprocessNode:
         user_content = []
         
         # Чтобы модель не "сбрасывала" контекст и не описывала картинку заново с нуля,
-        # мы прикрепляем картинки и видео ТОЛЬКО к самому первому сообщению в сессии.
-        if not is_followup:
-            if audio is not None:
-                if not mm_path:
-                    print("[LlamaCPP Warning] Передано аудио, но mmproj не выбран! Аудио будет проигнорировано.")
-                else:
+        # мы прикрепляем медиа ТОЛЬКО к самому первому сообщению в сессии.
+        # Источники: images (autogrow), videos (autogrow), audios (autogrow).
+        def _sorted_autogrow(d):
+            if not d:
+                return []
+            def _key(k):
+                if "_" in k:
+                    _, _, n = k.rpartition("_")
+                    if n.isdigit():
+                        return (0, int(n))
+                return (1, str(k))
+            return [d[k] for k in sorted(d.keys(), key=_key)]
+
+        image_list = _sorted_autogrow(images) if images else []
+        video_list = _sorted_autogrow(videos) if videos else []
+        audio_list = _sorted_autogrow(audios) if audios else []
+
+        if not is_followup and (image_list or video_list or audio_list):
+            if not mm_path:
+                print("[LlamaCPP Warning] Переданы медиа (images/videos/audios), но mmproj не выбран! Все медиа будут проигнорированы.")
+            else:
+                # === ВАРИАНТ A: сквозная нумерация + явные лейблы ===
+                # Images: каждый кадр батча раскрывается как отдельный Image N (сквозной индекс).
+                #         Модель может ссылаться на любой кадр по номеру: "use Image 3 as reference".
+                # Videos: каждый пин = Video N, внутри которого перечислены последовательные кадры.
+                #         Модель понимает, что это одно видео, и может ссылаться "Video 2 frames".
+                # Audios: каждый пин = Audio N.
+                #
+                # Итоговый формат (пример):
+                #   [Image 1] \n [jpeg] \n [Image 2] \n [jpeg] ...
+                #   [Video 1 — 8 sequential frames] \n [frame 1 jpeg] \n [frame 2 jpeg] ...
+                #   [Audio 1] \n [wav]
+
+                # --- IMAGES: сквозная нумерация всех картинок из всех пинов ---
+                img_counter = 0
+                for tensor in image_list:
+                    if tensor is None:
+                        continue
+                    if tensor.dim() == 3:
+                        tensor = tensor.unsqueeze(0)
+                    b64_images = tensors_to_base64_list(tensor)
+                    for b64_img in b64_images:
+                        img_counter += 1
+                        user_content.append({"type": "text", "text": f"[Image {img_counter}]"})
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
+
+                # --- VIDEOS: каждый пин — отдельное Video N, кадры внутри ---
+                for vid_idx, tensor in enumerate(video_list):
+                    if tensor is None:
+                        continue
+                    if tensor.dim() == 3:
+                        tensor = tensor.unsqueeze(0)
+                    # Оригинальное поведение: tensors_to_base64_list сама делает равномерную
+                    # выборку через np.linspace(0, total-1, max_frames, dtype=int)
+                    b64_video_frames = tensors_to_base64_list(tensor, max_frames=max_video_frames)
+                    user_content.append({
+                        "type": "text",
+                        "text": f"[Video {vid_idx+1} — {len(b64_video_frames)} sequential frames]"
+                    })
+                    for b64_frame in b64_video_frames:
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_frame}"}})
+
+                # --- AUDIOS: каждый пин — отдельное Audio N ---
+                for aud_idx, audio in enumerate(audio_list):
+                    if audio is None:
+                        continue
                     try:
                         audio_b64 = audio_to_base64_wav(audio)
-                        user_content.append({"type": "text", "text": "[ATTACHED AUDIO STREAM BELOW]:\n"})
+                        user_content.append({"type": "text", "text": f"[Audio {aud_idx+1}]"})
                         user_content.append({
                             "type": "input_audio",
                             "input_audio": {
@@ -1079,30 +1238,9 @@ class LlamaCPPSubprocessNode:
                                 "format": "wav"
                             }
                         })
-                        print("[LlamaCPP] Аудио успешно обработано и добавлено в Payload.")
+                        print(f"[LlamaCPP] Audio {aud_idx+1} processed.")
                     except Exception as e:
-                        print(f"[LlamaCPP Warning] Не удалось обработать аудио: {e}")
-                        
-            if image is not None:
-                if not mm_path:
-                    print("[LlamaCPP Warning] Переданы изображения, но mmproj не выбран! Изображения будут проигнорированы.")
-                else:
-                    b64_images = tensors_to_base64_list(image)
-                    if len(b64_images) == 1:
-                        user_content.append({"type": "text", "text": "\n[ATTACHED IMAGE BELOW — a single standalone picture]:\n"})
-                    else:
-                        user_content.append({"type": "text", "text": f"\n[ATTACHED IMAGES BELOW — {len(b64_images)} separate standalone pictures, NOT a video]:\n"})
-                    for b64_img in b64_images:
-                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}})
-
-            if video is not None:
-                if not mm_path:
-                    print("[LlamaCPP Warning] Передано видео, но mmproj не выбран! Видео будет проигнорировано.")
-                else:
-                    b64_video_frames = tensors_to_base64_list(video, max_frames=max_video_frames)
-                    user_content.append({"type": "text", "text": f"\n[ATTACHED VIDEO FRAMES BELOW — {len(b64_video_frames)} sequential frames from ONE video, in chronological order]:\n"})
-                    for b64_frame in b64_video_frames:
-                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_frame}"}})
+                        print(f"[LlamaCPP Warning] Не удалось обработать audio {aud_idx+1}: {e}")
 
         user_content.append({"type": "text", "text": prompt})
 
@@ -1259,7 +1397,7 @@ class LlamaCPPSubprocessNode:
         if not keep_model_loaded:
             kill_server(server_id)
 
-        return (clean_text.strip(), thoughts_text.strip(), perf_text, usage_stats, out_history)
+        return comfy_io.NodeOutput(clean_text.strip(), thoughts_text.strip(), perf_text, usage_stats, out_history)
 
 
 class LlamaCPPUnloadNode:

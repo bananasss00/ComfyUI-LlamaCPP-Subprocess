@@ -118,18 +118,21 @@ def mmproj_options() -> list[str]:
     return [NO_MMPROJ] + mmproj
 
 def system_prompt_options() -> list[str]:
-    # Прямое сканирование директории, минуя кеш folder_paths.
+    # Рекурсивное сканирование директории, минуя кеш folder_paths.
     # folder_paths.get_filename_list() кеширует результат и не инвалидирует
     # кеш при ручном добавлении файлов в папку, поэтому список не обновлялся
     # при перезагрузке страницы ComfyUI.
+    # Сканируем все подкаталоги; в дропдауне показываем относительный путь
+    # от корня промптов (например "subdir/my_prompt.txt").
     prompts_dir = prompt_root()
     if not prompts_dir.exists():
         return [NO_SYSTEM_PROMPT]
-    top_level_files = sorted([
-        f.name for f in prompts_dir.iterdir()
-        if f.is_file() and f.suffix.lower() == ".txt"
+    all_files = sorted([
+        str(f.relative_to(prompts_dir)).replace(os.sep, "/")
+        for f in prompts_dir.rglob("*.txt")
+        if f.is_file()
     ])
-    return [NO_SYSTEM_PROMPT] + top_level_files
+    return [NO_SYSTEM_PROMPT] + all_files
 
 def full_model_path(name: str) -> Path:
     path = folder_paths.get_full_path(LLM_FOLDER, name)
@@ -1152,8 +1155,11 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             sys_str = ""
             if system_prompt_preset != NO_SYSTEM_PROMPT:
                 # Пресет выбран → используем ТОЛЬКО его, system_prompt_text игнорируется
-                preset_path = folder_paths.get_full_path(PROMPT_FOLDER, system_prompt_preset)
-                if preset_path and os.path.exists(preset_path):
+                # Разрешаем путь напрямую через prompt_root(), т.к. system_prompt_preset
+                # может содержать подкаталоги (например "subdir/prompt.txt"),
+                # а folder_paths.get_full_path() может не найти файлы в подкаталогах.
+                preset_path = prompt_root() / system_prompt_preset
+                if preset_path.is_file():
                     with open(preset_path, "r", encoding="utf-8") as f:
                         sys_str = f.read().strip()
             else:

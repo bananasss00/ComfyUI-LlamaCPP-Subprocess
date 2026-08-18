@@ -118,8 +118,17 @@ def mmproj_options() -> list[str]:
     return [NO_MMPROJ] + mmproj
 
 def system_prompt_options() -> list[str]:
-    files = folder_paths.get_filename_list(PROMPT_FOLDER)
-    top_level_files =[name for name in files if os.sep not in name and "/" not in name]
+    # Прямое сканирование директории, минуя кеш folder_paths.
+    # folder_paths.get_filename_list() кеширует результат и не инвалидирует
+    # кеш при ручном добавлении файлов в папку, поэтому список не обновлялся
+    # при перезагрузке страницы ComfyUI.
+    prompts_dir = prompt_root()
+    if not prompts_dir.exists():
+        return [NO_SYSTEM_PROMPT]
+    top_level_files = sorted([
+        f.name for f in prompts_dir.iterdir()
+        if f.is_file() and f.suffix.lower() == ".txt"
+    ])
     return [NO_SYSTEM_PROMPT] + top_level_files
 
 def full_model_path(name: str) -> Path:
@@ -132,7 +141,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b10354"
+LLAMA_CPP_RELEASE_TAG = "b10488"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
 # Локальный кеш списка ассетов релиза. Release-assets на GitHub неизменны,
@@ -1142,12 +1151,15 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             messages = []
             sys_str = ""
             if system_prompt_preset != NO_SYSTEM_PROMPT:
+                # Пресет выбран → используем ТОЛЬКО его, system_prompt_text игнорируется
                 preset_path = folder_paths.get_full_path(PROMPT_FOLDER, system_prompt_preset)
                 if preset_path and os.path.exists(preset_path):
                     with open(preset_path, "r", encoding="utf-8") as f:
-                        sys_str += f.read() + "\n"
-            if system_prompt_text.strip():
-                sys_str += system_prompt_text
+                        sys_str = f.read().strip()
+            else:
+                # Пресет не выбран → используем ручной system_prompt_text
+                if system_prompt_text.strip():
+                    sys_str = system_prompt_text.strip()
 
             if sys_str.strip():
                 messages.append({"role": "system", "content": sys_str.strip()})

@@ -144,7 +144,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b10488"
+LLAMA_CPP_RELEASE_TAG = "b10643"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
 # Локальный кеш списка ассетов релиза. Release-assets на GitHub неизменны,
@@ -885,10 +885,25 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                                tooltip="Дополнительный 'виртуальный' резерв VRAM в ГБ."),
                 comfy_io.String.Input("server_id", default="default",
                                 tooltip="Уникальный идентификатор сервера."),
-                comfy_io.Int.Input("reasoning_budget", default=0, min=0, max=32768, step=128,
-                             tooltip="Динамический лимит токенов размышлений (0 = без лимита)."),
-                comfy_io.String.Input("reasoning_budget_message", default="Conclusion:",
-                                tooltip="Текст, завершающий мысли при превышении лимита."),
+                comfy_io.Combo.Input("reasoning_effort",
+                               options=["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                               default="default",
+                               tooltip="Reasoning Effort — качественный уровень 'думалки' (передается в chat-шаблон). "
+                                       "'default' = оставить как в шаблоне модели (не отправлять). "
+                                       "'none' = отключить размышления для этого запроса (enable_thinking=false). "
+                                       "Работает только если шаблон модели поддерживает reasoning_effort (Qwen3, GPT-OSS и т.п.) — "
+                                       "иначе флаг молча игнорируется. Ортогонален к reasoning_budget — можно использовать вместе."),
+                comfy_io.Int.Input("reasoning_budget", default=-1, min=-1, max=32768, step=128,
+                             tooltip="Жёсткий потолок токенов на фазу <think>. "
+                                     "-1 = без лимита (по умолчанию, поле не отправляется). "
+                                     "0 = немедленно закрыть <think> (подавить размышления, но оставить след). "
+                                     "N>0 = жёсткий лимит: сервер вставит reasoning_budget_message и закроет <think>. "
+                                     "Сэмплер бюджета включается только если шаблон модели умеет emit'ить <think>-блок. "
+                                     "Ортогонален к reasoning_effort — effort задаёт 'качество', budget гарантирует 'потолок'."),
+                comfy_io.String.Input("reasoning_budget_message",
+                                default="... thinking budget exceeded, let's answer now.",
+                                tooltip="Текст, который сервер вставит перед принудительным закрытием тега </think> при исчерпании бюджета. "
+                                        "Без этого текста модель часто выдаёт оборванный/некорректный ответ."),
             ],
             outputs=[
                 comfy_io.String.Output(display_name="text"),
@@ -917,8 +932,9 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 # misc
                 executable_path="auto", extra_cli_args="",
                 extra_reserve_vram=0.6, server_id="default",
-                reasoning_budget=0,
-                reasoning_budget_message="Conclusion:") -> comfy_io.NodeOutput:
+                reasoning_effort="default",
+                reasoning_budget=-1,
+                reasoning_budget_message="... thinking budget exceeded, let's answer now.") -> comfy_io.NodeOutput:
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -1296,13 +1312,35 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             "typical_p": samplers_dict.get("typical_p", 1.0),
         }
 
-        if reasoning_budget > 0:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": True,
-                "reasoning_budget": reasoning_budget
-            }
+        # --- Reasoning Effort (qualitative hint, top-level OAI field) ---
+        # "default" → omit the field entirely (use whatever the server was started with).
+        # "none"   → server-side sets enable_thinking=false for this request only.
+        # Any other value (minimal/low/medium/high/xhigh/max) is forwarded as-is.
+        # Works only if the model's chat template actually consumes reasoning_effort;
+        # otherwise the kwarg is silently ignored by the template.
+        if reasoning_effort != "default":
+            payload["reasoning_effort"] = reasoning_effort
+
+        # --- Reasoning Budget (hard token ceiling, top-level sampling field) ---
+        # IMPORTANT: the budget sampler in llama.cpp is armed ONLY from the top-level
+        # "reasoning_budget_tokens" field on the request body. Nesting it inside
+        # chat_template_kwargs.reasoning_budget (the old code) is a silent no-op.
+        #
+        # Values:
+        #   -1  = unlimited (default; we omit the field so the server default applies)
+        #    0  = force-close the thinking block immediately after it opens
+        #   N>0 = hard token cap; when exhausted the server injects
+        #         reasoning_budget_message and emits the </think> tag.
+        #
+        # The sampler only arms if the model template emits a detectable </think> block (Qwen3, DeepSeek-R1, GPT-OSS, Gemma4, etc.).
+        # For non-reasoning models, setting a budget is harmless (no-op).
+        #
+        # Orthogonal to reasoning_effort: effort = qualitative hint to the template,
+        # budget = guaranteed token ceiling. Both can be set in the same request.
+        if reasoning_budget != -1:
+            payload["reasoning_budget_tokens"] = reasoning_budget
             if reasoning_budget_message.strip():
-                payload["chat_template_kwargs"]["reasoning_budget_message"] = reasoning_budget_message.strip()
+                payload["reasoning_budget_message"] = reasoning_budget_message.strip()
 
         # ОБРАБОТКА ЗАПРЕЩЕННЫХ СЛОВ (LOGIT BIAS)
         if banned_tokens_str and banned_tokens_str.strip():

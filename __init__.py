@@ -144,7 +144,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b10643"
+LLAMA_CPP_RELEASE_TAG = "b11112"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
 # Локальный кеш списка ассетов релиза. Release-assets на GitHub неизменны,
@@ -402,13 +402,70 @@ def audio_to_base64_wav(audio_input) -> str:
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 
+# True, если llama.cpp сам прокинул headroom в DynamicVRAM (comfy-aimdo)
+# и ещё не возвращал исходное значение. Нужен, чтобы при остановке серверов
+# или отключении резервации чекбоксом не затирать headroom, выставленный
+# кем-то другим (например, нодой Painter VRAM).
+_AIMDO_HEADROOM_ACTIVE = False
+
+def _aimdo_enabled() -> bool:
+    """Проверяет, активен ли DynamicVRAM (comfy-aimdo).
+
+    Смотрим сначала comfy.memory_management (туда интеграцию aimdo добавляет
+    сам comfy-aimdo — так же проверяет нода Painter VRAM), затем
+    comfy.model_management: в разных сборках ComfyUI модули могут быть
+    как одним объектом, так и разными, где флаг выставлен только в одном.
+    """
+    try:
+        from comfy import memory_management as comfy_mm
+        if getattr(comfy_mm, "aimdo_enabled", False):
+            return True
+    except Exception:
+        pass
+    try:
+        from comfy import model_management as comfy_mm2
+        if getattr(comfy_mm2, "aimdo_enabled", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _sync_dynamic_vram_headroom(reserved_bytes: int) -> bool:
+    """Прокидывает резерв VRAM в DynamicVRAM (comfy-aimdo), если тот активен.
+
+    DynamicVRAM хранит собственный headroom внутри comfy-aimdo и никогда
+    не смотрит на model_management.EXTRA_RESERVED_VRAM, поэтому одной записи
+    в этот глобал недостаточно: пока aimdo включён, аллокатор ComfyUI считает
+    зарезервированную нами память доступной. Прокидываем значение в оба места —
+    ровно так же поступает сам ComfyUI с --reserve-vram при старте и нода
+    Painter VRAM (значение в байтах).
+    """
+    try:
+        if not _aimdo_enabled():
+            return False
+
+        import comfy_aimdo.control as aimdo
+        if getattr(aimdo, "lib", None) is None:
+            return False
+
+        aimdo.set_simple_vram_headroom(int(reserved_bytes))
+        return True
+    except Exception as exc:
+        print(f"[LlamaCPP] DynamicVRAM headroom не синхронизирован ({exc})")
+        return False
+
 def update_global_vram_reservation():
-    global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
+    global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM, _AIMDO_HEADROOM_ACTIVE
     if ORIGINAL_EXTRA_RESERVED_VRAM is None:
         ORIGINAL_EXTRA_RESERVED_VRAM = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
     
     total_reserve_bytes = 0
     for s_id, s_info in ACTIVE_SERVERS.items():
+        # Серверы с включённым чекбоксом disable_vram_reserve не участвуют
+        # в резервации: их реальное потребление и запас extra_reserve_vram
+        # не добавляются в глобальный бюджет памяти ComfyUI.
+        if not s_info.get("reserve_vram", True):
+            continue
         s_vram = s_info.get("vram_bytes", 0)
         s_extra_reserve_vram_gb = s_info.get("extra_reserve_vram", 0.6)
         s_extra_bytes = int(s_extra_reserve_vram_gb * (1024 ** 3))
@@ -416,12 +473,24 @@ def update_global_vram_reservation():
         
     if total_reserve_bytes > 0:
         comfy.model_management.EXTRA_RESERVED_VRAM = total_reserve_bytes
+        # DynamicVRAM (comfy-aimdo) держит собственный headroom и игнорирует
+        # EXTRA_RESERVED_VRAM — синхронизируем значение и туда.
+        if _sync_dynamic_vram_headroom(total_reserve_bytes):
+            _AIMDO_HEADROOM_ACTIVE = True
+            print(f"[LlamaCPP] DynamicVRAM (aimdo) headroom синхронизирован: {total_reserve_bytes / (1024**3):.2f} GB")
         print(f"[LlamaCPP] Суммарно зарезервировано VRAM для всех серверов: {total_reserve_bytes / (1024**3):.2f} GB")
     else:
         if ORIGINAL_EXTRA_RESERVED_VRAM is not None:
             try:
-                comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
-                print(f"[LlamaCPP] Все серверы остановлены. Восстановлено исходное значение EXTRA_RESERVED_VRAM: {ORIGINAL_EXTRA_RESERVED_VRAM / (1024**3):.2f} GB")
+                current_extra = getattr(comfy.model_management, "EXTRA_RESERVED_VRAM", 0)
+                if current_extra != ORIGINAL_EXTRA_RESERVED_VRAM:
+                    comfy.model_management.EXTRA_RESERVED_VRAM = ORIGINAL_EXTRA_RESERVED_VRAM
+                    print(f"[LlamaCPP] Резервация снята (серверы остановлены или отключены чекбоксом). Восстановлено исходное значение EXTRA_RESERVED_VRAM: {ORIGINAL_EXTRA_RESERVED_VRAM / (1024**3):.2f} GB")
+                # Возвращаем aimdo-headroom только если меняли его сами,
+                # чтобы не затереть значение, выставленное нодой Painter VRAM.
+                if _AIMDO_HEADROOM_ACTIVE:
+                    _sync_dynamic_vram_headroom(int(ORIGINAL_EXTRA_RESERVED_VRAM))
+                    _AIMDO_HEADROOM_ACTIVE = False
             except Exception:
                 pass
             ORIGINAL_EXTRA_RESERVED_VRAM = None
@@ -904,6 +973,12 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                                 default="... thinking budget exceeded, let's answer now.",
                                 tooltip="Текст, который сервер вставит перед принудительным закрытием тега </think> при исчерпании бюджета. "
                                         "Без этого текста модель часто выдаёт оборванный/некорректный ответ."),
+                # --- ЧЕКБОКС ДОБАВЛЕН ПОСЛЕДНИМ ПАРАМЕТРОМ ради совместимости старых воркфлоу/процессов ---
+                comfy_io.Boolean.Input("disable_vram_reserve", default=False,
+                                tooltip="Отключить резервацию памяти llama-моделью. "
+                                        "Выключено (по умолчанию): сервер добавляет своё реальное потребление VRAM + запас extra_reserve_vram в EXTRA_RESERVED_VRAM и headroom DynamicVRAM (comfy-aimdo). "
+                                        "Включено: llama не трогает глобальный бюджет памяти — резервацией управляет кто-то другой (Painter VRAM, DynamicVRAM, --reserve-vram) или никто. "
+                                        "Изменение применяется сразу, без перезапуска сервера."),
             ],
             outputs=[
                 comfy_io.String.Output(display_name="text"),
@@ -934,7 +1009,8 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 extra_reserve_vram=0.6, server_id="default",
                 reasoning_effort="default",
                 reasoning_budget=-1,
-                reasoning_budget_message="... thinking budget exceeded, let's answer now.") -> comfy_io.NodeOutput:
+                reasoning_budget_message="... thinking budget exceeded, let's answer now.",
+                disable_vram_reserve=False) -> comfy_io.NodeOutput:
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -1102,7 +1178,8 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 "port": port, 
                 "log_file": log_file,
                 "vram_bytes": 0,
-                "extra_reserve_vram": extra_reserve_vram
+                "extra_reserve_vram": extra_reserve_vram,
+                "reserve_vram": not disable_vram_reserve
             }
             print(f"[LlamaCPP] Сервер '{server_id}' готов на порту {port}.")
 
@@ -1117,6 +1194,19 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 update_global_vram_reservation()
             else:
                 print(f"[LlamaCPP] Не удалось извлечь потребление VRAM из потока для сервера '{server_id}'. Используются стандартные лимиты памяти.")
+                update_global_vram_reservation()
+
+        # Живая синхронизация резерва без перезапуска сервера.
+        # disable_vram_reserve и extra_reserve_vram не входят в current_config,
+        # поэтому их изменение НЕ требует перезапуска llama-server — при
+        # изменении значений просто пересчитываем глобальный резерв.
+        if server_id in ACTIVE_SERVERS:
+            s_info = ACTIVE_SERVERS[server_id]
+            new_reserve_flag = not disable_vram_reserve
+            if (s_info.get("reserve_vram", True) != new_reserve_flag
+                    or s_info.get("extra_reserve_vram", 0.6) != extra_reserve_vram):
+                s_info["reserve_vram"] = new_reserve_flag
+                s_info["extra_reserve_vram"] = extra_reserve_vram
                 update_global_vram_reservation()
 
         # ПОДГОТОВКА СТРУКТУРЫ MESSAGES И СЖАТИЕ КОНТЕКСТА

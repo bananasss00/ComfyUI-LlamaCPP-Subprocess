@@ -22,6 +22,7 @@ This project merges our persistent server logic (video/batch support, fast API c
 * 📁 **Smart Dropdowns**: Automatically scans and displays your `.gguf` models and `.txt` system prompts. Separates `mmproj` files from text models for safety.
 * 🛑 **Streaming & Interrupts**: Instantly stop generation by clicking `Cancel` in ComfyUI. The GPU frees up immediately.
 * 🛠️ **Advanced Memory Control**: Fine-tune VRAM usage with `memory_mode`, `gpu_layers`, and specific `n_cpu_moe_layers` (essential for running heavy Mixture-of-Experts models).
+* 🧮 **DynamicVRAM (comfy-aimdo) Headroom Sync**: The node's VRAM reservation is also pushed into DynamicVRAM's headroom (`set_simple_vram_headroom`), so it keeps working when comfy-aimdo is enabled — same approach as the Painter VRAM node. A `disable_vram_reserve` checkbox (added as the LAST parameter, off by default for backward compatibility with old workflows) lets you stop the llama model from reserving memory entirely and manage the headroom yourself (Painter VRAM / DynamicVRAM / `--reserve-vram`). Changes apply instantly, no server restart needed.
 * 🛡️ **Smart Error Parsing**: If you accidentally pair a text model with an incompatible `mmproj` vision encoder, the node will read the log and tell you exactly what went wrong.
 
 ---
@@ -84,6 +85,7 @@ A utility node to programmatically free VRAM. Pass any flow through it, and if `
 * 📁 **Умные списки**: Модели и текстовые промпты теперь выбираются из удобных выпадающих списков. Файлы `mmproj` автоматически отфильтровываются от текстовых моделей.
 * 🛑 **Потоковая передача и Отмена**: Нажмите `Cancel` в ComfyUI, и генерация мгновенно прервется, освободив видеокарту.
 * 🛠️ **Продвинутый контроль VRAM**: Настройте выгрузку слоев MoE на процессор (`n_cpu_moe_layers`), чтобы запускать тяжелые Mixture-of-Experts модели, которые не влезают в видеокарту.
+* 🧮 **Синхронизация с DynamicVRAM (comfy-aimdo)**: Резерв VRAM прокидывается и в headroom DynamicVRAM (`set_simple_vram_headroom`), поэтому работает и при включённом comfy-aimdo — тот же подход, что и у ноды Painter VRAM. Чекбокс `disable_vram_reserve` (добавлен ПОСЛЕДНИМ параметром, по умолчанию выключен ради совместимости старых воркфлоу) позволяет полностью отключить резервацию памяти llama-моделью и управлять headroom самостоятельно (Painter VRAM / DynamicVRAM / `--reserve-vram`). Изменение применяется сразу, без перезапуска сервера.
 * 🛡️ **Защита от ошибок**: Если вы случайно выберете несовместимые `mmproj` и текстовую модель, нода прочитает логи и выдаст понятную ошибку, а не просто зависнет.
 
 ---

@@ -52,6 +52,55 @@ def sanitize_prompt(text: str) -> str:
     
     return clean.strip()
 
+def parse_dry_sequence_breakers(text: str) -> list:
+    """Разбирает поле dry_sequence_breakers в список строк для llama-server.
+
+    Поддерживаются два формата ввода:
+      1. JSON-массив строк, скопированный целиком: ["\\n", ":", ...]
+      2. По одному breaker на строку (bare или в кавычках), с поддержкой
+         литеральных escape-последовательностей \\n, \\t, \\r, \\".
+
+    Пустые строки/элементы игнорируются: llama-server отклоняет ПУСТОЙ массив
+    breakers, поэтому поле без содержимого вообще не отправляется (сервер
+    использует свои дефолты: \\n, :, ", *).
+    """
+    if not text:
+        return []
+    text = str(text).strip()
+    if not text:
+        return []
+
+    # Формат 1: цельный JSON-массив строк
+    if text.startswith('[') and text.endswith(']'):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                result = [item for item in parsed if isinstance(item, str) and item != ""]
+                if result:
+                    return result
+        except Exception:
+            pass  # невалидный JSON — пробуем построчный разбор ниже
+
+    # Формат 2: по одному breaker на строку
+    def unescape(line: str) -> str:
+        return (line.replace('\\n', '\n').replace('\\t', '\t')
+                    .replace('\\r', '\r').replace('\\"', '"')
+                    .replace('\\\\', '\\'))
+
+    breakers = []
+    for raw in text.split('\n'):
+        line = raw.strip()
+        if not line:
+            continue
+        # строка в обрамляющих кавычках → снимаем их и раскрываем escape внутри
+        if len(line) >= 2 and line[0] == '"' and line[-1] == '"':
+            line = unescape(line[1:-1])
+        else:
+            line = unescape(line)
+        if line != "":
+            breakers.append(line)
+    return breakers
+
 # =======================================================================
 # 1. СИСТЕМА ПУТЕЙ И РЕЕСТР ФАЙЛОВ (DROPDOWNS)
 # =======================================================================
@@ -610,7 +659,27 @@ class LlamaCPPAdvancedSamplersNode:
                 }),
                 "repeat_penalty": ("FLOAT", {
                     "default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Штраф за повторения (Repetition Penalty). Значение 1.0 отключает штраф. Значения выше (например 1.1) заставляют модель реже зацикливаться на одних и тех же фразах."
+                    "tooltip": "Штраф за повторения (Repetition Penalty). Значение 1.0 отключает штраф. Значения выше (например 1.1) заставляют модель реже зацикливаться на одних и тех же фразах. Совет: вместо повышения repeat_penalty лучше использовать DRY ниже — он наказывает за копирование целых фраз, а не за каждое слово."
+                }),
+                "dry_multiplier": ("FLOAT", {
+                    "default": 0.8, "min": 0.0, "max": 5.0, "step": 0.05,
+                    "tooltip": "DRY (Don't Repeat Yourself) — штраф за ПОСЛЕДОВАТЕЛЬНОСТИ. Наказывает не за повтор отдельных слов, а за копирование целых фраз, которые уже звучали в тексте. 0.0 = выключено. 0.8 — рабочее значение по умолчанию; при пересушенном тексте снизьте до 0.6, для максимальной rewrite-агрессии (стадия дивергенции) — 1.0."
+                }),
+                "dry_base": ("FLOAT", {
+                    "default": 1.75, "min": 1.0, "max": 4.0, "step": 0.05,
+                    "tooltip": "Основание экспоненты DRY. Штраф = multiplier × base^(длина_повтора − allowed_length). Чем выше, тем резче штраф растёт с каждым дополнительным совпавшим токеном. 1.75 — стандарт."
+                }),
+                "dry_allowed_length": ("INT", {
+                    "default": 2, "min": 0, "max": 20, "step": 1,
+                    "tooltip": "Допустимая длина повтора: последовательности короче или равной этому значению не наказываются (2 позволяет естественные повторы вроде 'the' или повторяющихся ключевых слов). Меньше = строже."
+                }),
+                "dry_penalty_last_n": ("INT", {
+                    "default": -1, "min": -1, "max": 8192, "step": 1,
+                    "tooltip": "Окно сканирования повторов в токенах. -1 = не отправлять поле (сервер сканирует весь контекст — рекомендуемое поведение). 0 = выключено. N = смотреть только последние N токенов."
+                }),
+                "dry_sequence_breakers": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Стоп-границы DRY: реплики (по одной на строку), которые разбивают сравнение последовательностей (модель не будет считать повтор через их границы). Стандартные: \\n (пустая строка = перенос), : , \" , * — они уже заданы на сервере, поле можно оставить пустым. Пустое поле = не отправлять."
                 }),
                 "mirostat": ("INT", {
                     "default": 0, "min": 0, "max": 2, "step": 1,
@@ -646,7 +715,7 @@ class LlamaCPPAdvancedSamplersNode:
     FUNCTION = "get_samplers"
     CATEGORY = "LlamaCPP/Inference"
 
-    def get_samplers(self, dynatemp_range, dynatemp_exponent, xtc_probability, xtc_threshold, smoothing_factor, smoothing_curve, min_p, presence_penalty, frequency_penalty, repeat_penalty, mirostat, mirostat_tau, mirostat_eta, tfs_z, typical_p, banned_tokens=""):
+    def get_samplers(self, dynatemp_range, dynatemp_exponent, xtc_probability, xtc_threshold, smoothing_factor, smoothing_curve, min_p, presence_penalty, frequency_penalty, repeat_penalty, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, dry_sequence_breakers, mirostat, mirostat_tau, mirostat_eta, tfs_z, typical_p, banned_tokens=""):
         return ({
             "dynatemp_range": dynatemp_range,
             "dynatemp_exponent": dynatemp_exponent,
@@ -658,6 +727,11 @@ class LlamaCPPAdvancedSamplersNode:
             "presence_penalty": presence_penalty,
             "frequency_penalty": frequency_penalty,
             "repeat_penalty": repeat_penalty,
+            "dry_multiplier": dry_multiplier,
+            "dry_base": dry_base,
+            "dry_allowed_length": dry_allowed_length,
+            "dry_penalty_last_n": dry_penalty_last_n,
+            "dry_sequence_breakers": dry_sequence_breakers,
             "mirostat": mirostat,
             "mirostat_tau": mirostat_tau,
             "mirostat_eta": mirostat_eta,
@@ -1401,6 +1475,33 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             "tfs_z": samplers_dict.get("tfs_z", 1.0),
             "typical_p": samplers_dict.get("typical_p", 1.0),
         }
+
+        # --- DRY (Don't Repeat Yourself) ---
+        # Штраф за копирование ЦЕЛЫХ последовательностей, а не отдельных слов.
+        # Включается только при dry_multiplier > 0 (0.0 = поле не отправляется,
+        # сервер работает со своим дефолтом = выключено).
+        dry_multiplier = samplers_dict.get("dry_multiplier", 0.0)
+        if dry_multiplier and dry_multiplier > 0:
+            payload["dry_multiplier"] = dry_multiplier
+            # сервер сам заменяет base < 1.0 на дефолт (1.75)
+            payload["dry_base"] = samplers_dict.get("dry_base", 1.75)
+            payload["dry_allowed_length"] = samplers_dict.get("dry_allowed_length", 2)
+            # ВАЖНО: поле dry_penalty_last_n принимает только 0..INT32_MAX,
+            # значение -1 сервер отклонит → при -1 просто не отправляем поле
+            # (дефолт сервера = -1 = сканирование всего контекста).
+            dry_last_n = samplers_dict.get("dry_penalty_last_n", -1)
+            if dry_last_n is not None and dry_last_n >= 0:
+                payload["dry_penalty_last_n"] = dry_last_n
+            # ВАЖНО: пустой массив breakers сервер также отклоняет → отправляем
+            # только непустой список (дефолт сервера: "\n", ":", "\"", "*").
+            dry_breakers = parse_dry_sequence_breakers(samplers_dict.get("dry_sequence_breakers", ""))
+            if dry_breakers:
+                payload["dry_sequence_breakers"] = dry_breakers
+            print(f"[LlamaCPP] DRY sampler: multiplier={dry_multiplier}, "
+                  f"base={samplers_dict.get('dry_base', 1.75)}, "
+                  f"allowed_length={samplers_dict.get('dry_allowed_length', 2)}, "
+                  f"last_n={samplers_dict.get('dry_penalty_last_n', -1)}, "
+                  f"breakers={dry_breakers if dry_breakers else 'server defaults'}")
 
         # --- Reasoning Effort (qualitative hint, top-level OAI field) ---
         # "default" → omit the field entirely (use whatever the server was started with).

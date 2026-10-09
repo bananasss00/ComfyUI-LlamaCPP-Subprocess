@@ -193,7 +193,7 @@ register_folders()
 # 2. АВТО-СКАЧИВАНИЕ LLAMA-SERVER.EXE
 # =======================================================================
 
-LLAMA_CPP_RELEASE_TAG = "b11112"
+LLAMA_CPP_RELEASE_TAG = "b11537"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 VENDOR_ROOT = PACKAGE_ROOT / "vendor" / "llama.cpp"
 # Локальный кеш списка ассетов релиза. Release-assets на GitHub неизменны,

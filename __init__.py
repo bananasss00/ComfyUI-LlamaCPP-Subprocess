@@ -101,6 +101,51 @@ def parse_dry_sequence_breakers(text: str) -> list:
             breakers.append(line)
     return breakers
 
+def measure_process_vram_mib(pid: int) -> float:
+    """Измеряет РЕАЛЬНОЕ потребление VRAM процессом llama-server средствами ОС.
+
+    Это первичный источник истины, immune к смене формата лога llama.cpp:
+      1) nvidia-smi --query-compute-apps (NVIDIA; на Windows/WDDM часто N/A)
+      2) PowerShell-счётчик '\\GPU Process Memory(pid_*)\\Local Usage' (Win10/11, WDDM)
+
+    Возвращает MiB или 0.0, если измерить не удалось (тогда вызывающий код
+    откатывается на парсинг лога).
+    """
+    # 1) nvidia-smi — работает и на Linux, и на Windows (в PATH у драйвера NVIDIA)
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout
+        total = 0.0
+        found = False
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2 and parts[0] == str(pid):
+                total += float(parts[1])  # MiB; "N/A" бросит ValueError -> уходим в except
+                found = True
+        if found:
+            return total
+    except Exception:
+        pass
+
+    # 2) Windows WDDM: счётчики GPU Process Memory (точные per-process байты)
+    if platform.system() == "Windows":
+        try:
+            ps_cmd = (
+                "(Get-Counter -Counter '\\GPU Process Memory(pid_" + str(pid) + "*)\\Local Usage' "
+                "-ErrorAction Stop).CounterSamples | "
+                "Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=15).stdout.strip()
+            val = float(out)  # байты
+            if val > 0:
+                return val / (1024 * 1024)
+        except Exception:
+            pass
+    return 0.0
+
 # =======================================================================
 # 1. СИСТЕМА ПУТЕЙ И РЕЕСТР ФАЙЛОВ (DROPDOWNS)
 # =======================================================================
@@ -1200,17 +1245,40 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore")
             
-            # Переменная для перехвата VRAM из потока (используем list для изменения внутри функции)
-            startup_vram_mb = [0.0]
-            vram_pattern = re.compile(r'(?:VRAM|(?:CUDA|Vulkan|Metal|SYCL)\d+.*?buffer size)[^:\n]*[:=]\s*([\d.]+)\s*MiB', re.IGNORECASE)
-            
+            # --- Перехват VRAM из потока лога ---
+            # Считаем СУММУ буферов ПОСЛЕДНЕГО прохода загрузки. Лог llama.cpp
+            # печатает буферы пачками: model + KV (ISWA даёт ДВЕ KV-инстанции) +
+            # output + compute — все реальные, суммируются. Повторная загрузка
+            # модели (fit-перепланировка, ретрай) начинается с маркера
+            # "offloaded X/Y layers to GPU" -> счётчик проходов инкрементируется,
+            # словарь сбрасывается: старая версия тупо суммировала ВСЕ строки
+            # лога и на повторных печатях раздувала оценку в разы.
+            # Учитываем только буферы GPU-устройств (CUDA0/VULKAN1/...):
+            # CUDA_Host и CPU — это pinned/system RAM, VRAM не потребляют.
+            startup_buffer_mib = {}
+            vram_pattern = re.compile(
+                r'\b(?P<be>CUDA|Vulkan|Metal|SYCL)(?P<idx>\d+)\s+(?P<kind>\w[\w ]*?)\s*buffer size[^:\n]*[:=]\s*(?P<val>[\d.]+)\s*MiB',
+                re.IGNORECASE)
+            pass_marker = re.compile(r'offloaded \d+/\d+ layers to GPU', re.IGNORECASE)
+            pass_state = {"n": 0}
+
             def pipe_reader():
+                occ = {}
                 for line in process.stdout:
                     try:
                         log_file.write(line)
+                        if pass_marker.search(line):
+                            pass_state["n"] += 1
+                            occ = {}
+                            startup_buffer_mib.clear()
+                            continue
                         match = vram_pattern.search(line)
                         if match:
-                            startup_vram_mb[0] += float(match.group(1))
+                            base = (match.group("be").upper(), match.group("idx"),
+                                    match.group("kind").strip().lower())
+                            key = (pass_state["n"], base, occ.get(base, 0))
+                            occ[base] = occ.get(base, 0) + 1
+                            startup_buffer_mib[key] = float(match.group("val"))
                     except Exception:
                         break
                         
@@ -1258,8 +1326,26 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             print(f"[LlamaCPP] Сервер '{server_id}' готов на порту {port}.")
 
             # Даем потоку долю секунды на обработку последних строк перед тем как забрать результат
-            time.sleep(0.2)
-            exact_vram_bytes = int(startup_vram_mb[0] * 1024 * 1024)
+            time.sleep(0.5)
+            log_vram_mib = sum(startup_buffer_mib.values())
+
+            # ПЕРВИЧНЫЙ источник: измерение процесса средствами ОС (nvidia-smi /
+            # GPU Process Memory счётчик). Лог llama.cpp от версии к версии меняет
+            # формат и печатает буферы повторно -> суммарная оценка может быть
+            # завышена в разы. ОС-измерение врёт не может.
+            os_vram_mib = measure_process_vram_mib(process.pid)
+            if os_vram_mib > 0:
+                exact_vram_bytes = int(os_vram_mib * 1024 * 1024)
+                print(f"[LlamaCPP] VRAM процесса '{server_id}' (PID {process.pid}, измерено ОС): {os_vram_mib / 1024:.2f} GB")
+                if log_vram_mib > 0:
+                    print(f"[LlamaCPP]   (справка: сумма буферов по логу = {log_vram_mib / 1024:.2f} GB; детали: "
+                          + ", ".join(f"{k[1][0]}{k[1][1]}/{k[1][2]}#{k[2]}={v:.0f}MiB" for k, v in sorted(startup_buffer_mib.items())) + ")")
+            elif log_vram_mib > 0:
+                exact_vram_bytes = int(log_vram_mib * 1024 * 1024)
+                print(f"[LlamaCPP] VRAM по логу (сумма буферов): {log_vram_mib / 1024:.2f} GB (детали: "
+                      + ", ".join(f"{k[1][0]}{k[1][1]}/{k[1][2]}#{k[2]}={v:.0f}MiB" for k, v in sorted(startup_buffer_mib.items())) + ")")
+            else:
+                exact_vram_bytes = 0
 
             if exact_vram_bytes > 0:
                 ACTIVE_SERVERS[server_id]["vram_bytes"] = exact_vram_bytes
@@ -1267,7 +1353,7 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 print(f"[LlamaCPP] Извлечено потребление VRAM для сервера '{server_id}': {exact_vram_gb:.2f} GB")
                 update_global_vram_reservation()
             else:
-                print(f"[LlamaCPP] Не удалось извлечь потребление VRAM из потока для сервера '{server_id}'. Используются стандартные лимиты памяти.")
+                print(f"[LlamaCPP] Не удалось извлечь потребление VRAM (ОС-измерение недоступно, в логе нет буферов) для сервера '{server_id}'. Используются стандартные лимиты памяти.")
                 update_global_vram_reservation()
 
         # Живая синхронизация резерва без перезапуска сервера.

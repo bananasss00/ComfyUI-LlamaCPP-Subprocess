@@ -1,4 +1,5 @@
 import os
+import struct
 import subprocess
 import time
 import urllib.request
@@ -145,6 +146,185 @@ def measure_process_vram_mib(pid: int) -> float:
         except Exception:
             pass
     return 0.0
+
+# =======================================================================
+# 0b. GGUF: ПОДСЧЁТ ЭКСПЕРТНЫХ ВЕСОВ + АВТО-ПОДБОР MoE-КЭША
+# =======================================================================
+
+# (block_size, type_size) — сверено с gguf-py GGML_QUANT_SIZES (ggml master, 2026).
+# ВАЖНО: значения enum актуальные: IQ4_XS=23, I8=24, IQ1_M=29, BF16=30, MXFP4=39.
+_GGML_QUANT_SIZES = {
+    0: (1, 4),    # F32
+    1: (1, 2),    # F16
+    2: (32, 18),  # Q4_0
+    3: (32, 20),  # Q4_1
+    6: (32, 22),  # Q5_0
+    7: (32, 24),  # Q5_1
+    8: (32, 34),  # Q8_0
+    9: (32, 40),  # Q8_1
+    10: (256, 84),   # Q2_K
+    11: (256, 110),  # Q3_K
+    12: (256, 144),  # Q4_K
+    13: (256, 176),  # Q5_K
+    14: (256, 210),  # Q6_K
+    15: (256, 292),  # Q8_K
+    16: (256, 66),   # IQ2_XXS
+    17: (256, 74),   # IQ2_XS
+    18: (256, 98),   # IQ3_XXS
+    19: (256, 50),   # IQ1_S
+    20: (32, 18),    # IQ4_NL
+    21: (256, 110),  # IQ3_S
+    22: (256, 82),   # IQ2_S
+    23: (256, 136),  # IQ4_XS
+    24: (1, 1),      # I8
+    25: (1, 2),      # I16
+    26: (1, 4),      # I32
+    27: (1, 8),      # I64
+    28: (1, 8),      # F64
+    29: (256, 56),   # IQ1_M
+    30: (1, 2),      # BF16
+    34: (256, 54),   # TQ1_0
+    35: (256, 66),   # TQ2_0
+    39: (32, 17),    # MXFP4
+    40: (64, 36),    # NVFP4
+    41: (128, 18),   # Q1_0
+}
+
+# KV-скаляры GGUF v2/v3: type -> размер в байтах
+_GGUF_KV_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+# Тензоры экспертов: blk.N.ffn_up_exps / ffn_down_exps / ffn_gate_exps
+# (shared experts ffn_*_shexp НЕ считаются — это обычные плотные матмульты вне кэша)
+_EXPS_TENSOR_RE = re.compile(r'\.ffn_(up|down|gate)_exps$')
+
+# Кэш разбора заголовков: путь -> (mtime, size, expert_mib)
+_GGUF_EXPERT_CACHE = {}
+
+def _gguf_read_string(f) -> bytes:
+    (n,) = struct.unpack('<Q', f.read(8))
+    return f.read(n)
+
+def _gguf_skip_value(f, vtype: int):
+    if vtype == 8:      # STRING
+        _gguf_read_string(f)
+    elif vtype == 9:    # ARRAY: type u32, len u64, затем len значений
+        t, n = struct.unpack('<IQ', f.read(12))
+        for _ in range(n):
+            _gguf_skip_value(f, t)
+    elif vtype in _GGUF_KV_SIZES:
+        f.read(_GGUF_KV_SIZES[vtype])
+    else:
+        raise ValueError(f"Неизвестный тип GGUF KV: {vtype}")
+
+def gguf_expert_weights_mib(model_path) -> float:
+    """Суммарный размер ВСЕХ экспертных тензоров (ffn_*_exps) в GGUF-файле, MiB.
+
+    Читает ТОЛЬКО заголовок (метаданные + список тензоров), сами веса с диска
+    не читаются — разбор занимает доли секунды даже для моделей на 100+ ГБ.
+    Результат кешируется по (mtime, size) файла.
+    Возвращает 0.0, если модель не MoE или заголовок разобрать не удалось.
+    """
+    try:
+        p = Path(model_path)
+        if not p.is_file():
+            return 0.0
+        st = p.stat()
+        cached = _GGUF_EXPERT_CACHE.get(str(p))
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return cached[2]
+
+        total_bytes = 0
+        n_exps = 0
+        with open(p, 'rb') as f:
+            if f.read(4) != b'GGUF':
+                raise ValueError("это не GGUF-файл")
+            (version,) = struct.unpack('<I', f.read(4))
+            if version < 2:
+                raise ValueError(f"GGUF v{version} не поддерживается (нужен v2/v3)")
+            n_tensors, n_kv = struct.unpack('<QQ', f.read(16))
+            for _ in range(n_kv):
+                _gguf_read_string(f)  # ключ
+                (vtype,) = struct.unpack('<I', f.read(4))
+                _gguf_skip_value(f, vtype)
+            for _ in range(n_tensors):
+                name = _gguf_read_string(f).decode('utf-8', 'ignore')
+                (n_dims,) = struct.unpack('<I', f.read(4))
+                dims = struct.unpack('<' + 'Q' * n_dims, f.read(8 * n_dims))
+                ttype, _offset = struct.unpack('<IQ', f.read(12))
+                if _EXPS_TENSOR_RE.search(name):
+                    q = _GGML_QUANT_SIZES.get(ttype)
+                    if q:
+                        numel = 1
+                        for d in dims:
+                            numel *= d
+                        bs, ts = q
+                        total_bytes += ((numel + bs - 1) // bs) * ts
+                        n_exps += 1
+        mib = total_bytes / (1024 * 1024)
+        _GGUF_EXPERT_CACHE[str(p)] = (st.st_mtime, st.st_size, mib)
+        if n_exps:
+            print(f"[LlamaCPP] GGUF '{p.name}': экспертных тензоров {n_exps} шт., суммарно {mib:.0f} MiB.")
+        return mib
+    except Exception as e:
+        print(f"[LlamaCPP] Не удалось разобрать GGUF-заголовок ({e}) — авто-подбор MoE-кэша недоступен.")
+        return 0.0
+
+def _free_vram_mib() -> float:
+    """Свободная VRAM в MiB (учитывает резерв ComfyUI). 0.0 = измерить не удалось."""
+    try:
+        mm = comfy.model_management
+        if hasattr(mm, "get_free_memory"):
+            return float(mm.get_free_memory()) / (1024 * 1024)
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, _total = torch.cuda.mem_get_info()
+            return free / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
+
+# ~10% от суммарного размера экспертных весов — рекомендация из PR #29887
+MOE_CACHE_AUTO_SHARE = 0.10
+
+def resolve_moe_cache_mib(moe_cache_mib, model_path) -> int:
+    """Разрешает значение moe_cache_mib в конкретный размер кэша для CLI.
+
+    0  -> 0 (выключено, ничего не передаём)
+    >0 -> ручное значение MiB как есть
+    -1 -> авто: ~10% от суммарного размера экспертных весов модели,
+          ограниченное 30% свободной VRAM (чтобы не выдавить KV-cache).
+    """
+    if not moe_cache_mib:
+        return 0
+    if moe_cache_mib > 0:
+        return int(moe_cache_mib)
+
+    # -1 => авто
+    exp_mib = gguf_expert_weights_mib(model_path)
+    if exp_mib <= 0:
+        print("[LlamaCPP] moe_cache_mib=auto: экспертные тензоры (ffn_*_exps) не найдены — "
+              "это не MoE-модель или офлоад экспертов не имеет смысла. Флаг --moe-cache-mib НЕ передан. "
+              "Для плотных моделей используйте виджет n_cpu_ffn_layers (--n-cpu-ffn).")
+        return 0
+
+    recommended = exp_mib * MOE_CACHE_AUTO_SHARE
+    free_mib = _free_vram_mib()
+    cap = max(256.0, free_mib * 0.30) if free_mib > 0 else 16384.0
+    value = int(min(recommended, cap, 65536))
+    if value < 1:
+        print("[LlamaCPP] MoE-кэш (auto): рекомендованный размер < 1 MiB — флаг не передан.")
+        return 0
+    if free_mib > 0 and recommended > cap:
+        print(f"[LlamaCPP] MoE-кэш (auto): эксперты = {exp_mib:.0f} MiB → 10% = {recommended:.0f} MiB, "
+              f"но свободной VRAM всего {free_mib:.0f} MiB — ограничено до {value} MiB "
+              f"(можно задать вручную, если готовы пожертвовать KV-cache).")
+    else:
+        print(f"[LlamaCPP] MoE-кэш (auto): эксперты = {exp_mib:.0f} MiB → 10% = {recommended:.0f} MiB → "
+              f"--moe-cache-mib {value}. Следите за hit-rate в логе llama-server.")
+    return value
 
 # =======================================================================
 # 1. СИСТЕМА ПУТЕЙ И РЕЕСТР ФАЙЛОВ (DROPDOWNS)
@@ -812,6 +992,13 @@ class LlamaCPPSpeculativeNode:
                 "gpu_layers_draft": ("INT", {
                     "default": 99, "min": -1, "max": 999,
                     "tooltip": "Количество слоев вспомогательной модели, переносимых в VRAM GPU (-ngld). 99 означает полный перенос."
+                }),
+                # --- ПАРАМЕТР ДОБАВЛЕН ПОСЛЕДНИМ ВИДЖЕТОМ ради совместимости старых воркфлоу/процессов ---
+                "spec_draft_n_cpu_moe": ("INT", {
+                    "default": 0, "min": 0, "max": 999, "step": 1,
+                    "tooltip": "MoE-эксперты ЧЕРНОВИКА (draft) на CPU (--spec-draft-n-cpu-moe N): офлоадит экспертные веса первых N слоев draft-модели в RAM, "
+                               "чтобы главный модель + MoE-кэш + KV заняли больше VRAM. Нужен, когда draft-модель сама является MoE (MTP-головы Qwen3-Next / GLM и т.п.). "
+                               "999 = все слои (аналог --spec-draft-cpu-moe). 0 = не передавать. Изменение требует перезапуска сервера."
                 })
             }
         }
@@ -821,14 +1008,15 @@ class LlamaCPPSpeculativeNode:
     FUNCTION = "get_settings"
     CATEGORY = "LlamaCPP/Inference"
 
-    def get_settings(self, draft_model, spec_type, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, gpu_layers_draft):
+    def get_settings(self, draft_model, spec_type, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, gpu_layers_draft, spec_draft_n_cpu_moe=0):
         return ({
             "draft_model": draft_model,
             "spec_type": spec_type,
             "spec_draft_n_max": spec_draft_n_max,
             "spec_draft_n_min": spec_draft_n_min,
             "spec_draft_p_min": spec_draft_p_min,
-            "gpu_layers_draft": gpu_layers_draft
+            "gpu_layers_draft": gpu_layers_draft,
+            "spec_draft_n_cpu_moe": spec_draft_n_cpu_moe
         },)
     
 class LlamaCPPChatHistoryNode:
@@ -1098,6 +1286,24 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                                         "Выключено (по умолчанию): сервер добавляет своё реальное потребление VRAM + запас extra_reserve_vram в EXTRA_RESERVED_VRAM и headroom DynamicVRAM (comfy-aimdo). "
                                         "Включено: llama не трогает глобальный бюджет памяти — резервацией управляет кто-то другой (Painter VRAM, DynamicVRAM, --reserve-vram) или никто. "
                                         "Изменение применяется сразу, без перезапуска сервера."),
+                # --- ПАРАМЕТР ДОБАВЛЕН ПОСЛЕДНИМ ВИДЖЕТОМ ради совместимости старых воркфлоу/процессов ---
+                comfy_io.Int.Input("moe_cache_mib", default=0, min=-1, max=65536, step=256,
+                             tooltip="GPU LRU-кэш MoE-экспертов (--moe-cache-mib) в MiB для весов экспертов, оставленных в CPU. "
+                                     "Работает ВМЕСТЕ с memory_mode = cpu_moe_layers / gpu_and_cpu_moe_layers (--n-cpu-moe) ИЛИ с override_tensor вида 'exps=CPU'. "
+                                     "Горячие эксперты держатся в VRAM и считаются на GPU, промахи подтягиваются с PCIe → заметный буст декода MoE-моделей (x1.5-2+ при хорошем hit-rate). "
+                                     "0 = выключено (по умолчанию). -1 = АВТО: нода сама разберет заголовок GGUF, посчитает суммарный размер экспертных весов (ffn_*_exps) и возьмет ~10% от него, "
+                                     "ограничив 30% свободной VRAM (вычисленное значение печатается в консоль). Ручное значение: смотрите строку 'GGUF: экспертных тензоров ... суммарно ... MiB' в консоли и берите ~10%. "
+                                     "Эффективен на малых батчах (генерация, ≤32 токенов на ubatch); на мульти-GPU бюджет делится как --tensor-split. "
+                                     "Оставляйте запас VRAM под KV-cache, иначе кэш вытеснит контекст и всё замедлится. Изменение требует перезапуска сервера."),
+                # --- ПАРАМЕТР ДОБАВЛЕН ПОСЛЕДНИМ ВИДЖЕТОМ ради совместимости старых воркфлоу/процессов ---
+                comfy_io.Int.Input("n_cpu_ffn_layers", default=0, min=0, max=999, step=1,
+                             tooltip="Dense-FFN слои на CPU (--n-cpu-ffn N): держит обычные (не MoE) FFN-веса первых N слоев в RAM. "
+                                     "ПРЕДНАЗНАЧЕНО ДЛЯ ПЛОТНЫХ (dense) моделей — Gemma dense, Llama, Qwen dense и т.п., когда они не влезают в VRAM. "
+                                     "Для MoE-моделей используйте n_cpu_moe_layers (эксперты) — у них dense-FFN обычно маленький/шаред и выгода почти нулевая. "
+                                     "0 = не передавать. Логика как у -ngl, но режет только FFN: внимание и KV-cache остаются на GPU. "
+                                     "Изменение требует перезапуска сервера."),
+                # MoE-офлоад ЧЕРНОВИКА (--spec-draft-n-cpu-moe) переехал в ноду LlamaCPP Speculative Settings
+                # (виджет spec_draft_n_cpu_moe, добавлен там ПОСЛЕДНИМ ради совместимости старых воркфлоу).
             ],
             outputs=[
                 comfy_io.String.Output(display_name="text"),
@@ -1129,7 +1335,10 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 reasoning_effort="default",
                 reasoning_budget=-1,
                 reasoning_budget_message="... thinking budget exceeded, let's answer now.",
-                disable_vram_reserve=False) -> comfy_io.NodeOutput:
+                disable_vram_reserve=False,
+                # добавлен ПОСЛЕДНИМ ради обратной совместимости старых воркфлоу (позиции виджетов)
+                moe_cache_mib=0,
+                n_cpu_ffn_layers=0) -> comfy_io.NodeOutput:
         
         global ACTIVE_SERVERS, ORIGINAL_EXTRA_RESERVED_VRAM
 
@@ -1154,6 +1363,7 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
         spec_draft_n_min = 0
         spec_draft_p_min = 0.0
         gpu_layers_draft = -1
+        spec_draft_n_cpu_moe = 0
         
         if spec_settings:
             spec_type = spec_settings.get("spec_type", "none")
@@ -1161,6 +1371,7 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             spec_draft_n_min = spec_settings.get("spec_draft_n_min", 0)
             spec_draft_p_min = spec_settings.get("spec_draft_p_min", 0.0)
             gpu_layers_draft = spec_settings.get("gpu_layers_draft", -1)
+            spec_draft_n_cpu_moe = spec_settings.get("spec_draft_n_cpu_moe", 0)
             
             draft_model_name = spec_settings.get("draft_model", "")
             if draft_model_name and draft_model_name not in {NO_MODELS_FOUND, NO_DRAFT_MODEL}:
@@ -1169,13 +1380,15 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
         # Create config hash to detect if we need to restart server
         current_config = {
             "exe": exe_path, "model": m_path, "mmproj": mm_path, "ctx": ctx_size, "ctx_q": context_quantization,
-            "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers,
+            "mem": memory_mode, "gpu": gpu_layers, "moe": n_cpu_moe_layers, "moe_cache_mib": moe_cache_mib,
+            "ffn_cpu": n_cpu_ffn_layers,
             "args": extra_cli_args, "reasoning": reasoning, "flash_attn": flash_attention,
             "batch": batch_size, "np": parallel_requests, "no_mmap": no_mmap, "no_warmup": no_warmup, 
             "mlock": mlock, "fitt": fit_target_mib, "ot": override_tensor,
             "spec_type": spec_type, "draft_model": draft_model_path, 
             "spec_draft_n_max": spec_draft_n_max, "spec_draft_n_min": spec_draft_n_min,
-            "spec_draft_p_min": spec_draft_p_min, "gpu_layers_draft": gpu_layers_draft
+            "spec_draft_p_min": spec_draft_p_min, "gpu_layers_draft": gpu_layers_draft,
+            "draft_moe": spec_draft_n_cpu_moe
         }
 
         # ЗАЩИТА ОТ КРАШЕЙ (если процесс был убит через диспетчер задач)
@@ -1211,6 +1424,18 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
             if memory_mode in {"cpu_moe_layers", "gpu_and_cpu_moe_layers"}:
                 cmd.extend(["--n-cpu-moe", str(n_cpu_moe_layers)])
             
+            # GPU LRU-кэш MoE-экспертов, оставленных в CPU (--n-cpu-moe / -ot exps=CPU).
+            # moe_cache_mib: 0 = выкл; >0 = ручной размер MiB; -1 = авто (~10% экспертных
+            # весов из GGUF, ограничено 30% свободной VRAM). Включение/смена размера
+            # требует перезапуска сервера (moe_cache_mib входит в current_config).
+            resolved_moe_cache = resolve_moe_cache_mib(moe_cache_mib, m_path)
+            if resolved_moe_cache > 0:
+                cmd.extend(["--moe-cache-mib", str(resolved_moe_cache)])
+            
+            # Dense-FFN первых N слоев в CPU (для плотных моделей; у MoE используйте --n-cpu-moe)
+            if n_cpu_ffn_layers > 0:
+                cmd.extend(["--n-cpu-ffn", str(n_cpu_ffn_layers)])
+            
             if context_quantization and context_quantization != "none":
                 cmd.extend(["--cache-type-k", context_quantization, "--cache-type-v", context_quantization])
             
@@ -1232,6 +1457,14 @@ class LlamaCPPSubprocessNode(comfy_io.ComfyNode):
                 
             if gpu_layers_draft >= 0:
                 cmd.extend(["-ngld", str(gpu_layers_draft)])
+            
+            # MoE-офлоад draft-модели — задается виджетом spec_draft_n_cpu_moe в ноде Speculative Settings
+            if spec_draft_n_cpu_moe > 0:
+                cmd.extend(["--spec-draft-n-cpu-moe", str(spec_draft_n_cpu_moe)])
+                if not spec_type or spec_type == "none":
+                    print("[LlamaCPP] Внимание: spec_draft_n_cpu_moe задан, но spec_type=none — "
+                          "флаг передан, но серверу нечего им офлоадить.")
+            
             if reasoning != "auto": cmd.extend(["--reasoning", reasoning])
             if extra_cli_args and extra_cli_args.strip():
                 # Заменяем обратные слэши на прямые до shlex.split, чтобы Python не съедал их на Windows

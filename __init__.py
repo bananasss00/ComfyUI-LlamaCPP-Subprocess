@@ -193,9 +193,12 @@ _GGML_QUANT_SIZES = {
 # KV-скаляры GGUF v2/v3: type -> размер в байтах
 _GGUF_KV_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
-# Тензоры экспертов: blk.N.ffn_up_exps / ffn_down_exps / ffn_gate_exps
-# (shared experts ffn_*_shexp НЕ считаются — это обычные плотные матмульты вне кэша)
-_EXPS_TENSOR_RE = re.compile(r'\.ffn_(up|down|gate)_exps$')
+# Тензоры экспертов — зеркало официального LLM_FFN_EXPS_REGEX из llama.cpp (common/common.h):
+#   "\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+# Покрывает blk.N.ffn_{up,down,gate,gate_up}_exps(.weight) и blk.N.ffn_*_chexps(.weight).
+# БЕЗ якоря $: имена GGUF-тензоров всегда с суффиксом ".weight"!
+# Shared experts (ffn_*_shexp) и ffn_norm_exps НЕ матчатся и не считаются — это не кэшируемые эксперты.
+_EXPS_TENSOR_RE = re.compile(r'\.ffn_(up|down|gate|gate_up)_(ch|)exps')
 
 # Кэш разбора заголовков: путь -> (mtime, size, expert_mib)
 _GGUF_EXPERT_CACHE = {}
